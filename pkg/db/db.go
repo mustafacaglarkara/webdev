@@ -955,3 +955,54 @@ func buildBulkUpdateByKeySQL(dialect, table, keyCol string, updateCols []string,
 func buildMergeSQLServer(table string, cols []string, keyCols []string, updateCols []string, rows [][]any) (string, []any, error) {
 	return buildMergeSQLServerWithOptions(table, cols, keyCols, updateCols, rows, nil)
 }
+
+// Tx: context tabanlı transaction wrapper. fn başarılı dönerse commit, hata dönerse rollback.
+// Not: Retry/policy devrede olduğundan, fn idempotent olmalıdır veya deadlock gibi durumlar için güvenle tekrar çalıştırılabilir olmalıdır.
+func Tx(ctx context.Context, fn func(ctx context.Context, tx *gorm.DB) error) error {
+	db := DB()
+	if db == nil {
+		return errors.New("db.Init çağrılmamış")
+	}
+	ctx = ensureQueryID(ctx)
+	return doWithPolicies(ctx, func() error {
+		// Her transaction'a benzersiz tx_id verelim (log korelasyonu için)
+		tctx := WithTxID(ctx, uuid.NewString())
+		return db.WithContext(tctx).Transaction(func(tx *gorm.DB) error {
+			return fn(tctx, tx)
+		})
+	})
+}
+
+// ExecReturningSQL: dosyadan yüklenen RETURNING/OUTPUT içeren DML'in dönen satırlarını dest'e yazar.
+func ExecReturningSQL[T any](ctx context.Context, fsys fs.FS, file string, params map[string]any, dest *[]T) error {
+	db := DB()
+	if db == nil {
+		return errors.New("db.Init çağrılmamış")
+	}
+	raw, err := loadSQL(fsys, file)
+	if err != nil {
+		return err
+	}
+	return ExecReturningString[T](ctx, raw, params, dest)
+}
+
+// ExecReturningString: metin SQL (RETURNING/OUTPUT içeren) çalıştırır ve dönen satırları dest'e yazar.
+func ExecReturningString[T any](ctx context.Context, sqlText string, params map[string]any, dest *[]T) error {
+	db := DB()
+	if db == nil {
+		return errors.New("db.Init çağrılmamış")
+	}
+	ctx = ensureQueryID(ctx)
+	bound, args, err := bindNamedToQ(sqlText, params)
+	if err != nil {
+		return err
+	}
+	start := time.Now()
+	var qerr error
+	err = doWithPolicies(ctx, func() error {
+		qerr = db.WithContext(ctx).Raw(bound, args...).Scan(dest).Error
+		return qerr
+	})
+	logExec(ctx, "exec_return", bound, args, start, err, int64(len(*dest)))
+	return err
+}

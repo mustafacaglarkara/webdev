@@ -2,10 +2,12 @@ package db_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"testing/fstest"
 
 	mydb "github.com/mustafacaglarkara/webdev/pkg/db"
+	"gorm.io/gorm"
 )
 
 type User struct {
@@ -156,5 +158,46 @@ func TestListBinderAndShortcuts(t *testing.T) {
 	}
 	if len(left) != 1 {
 		t.Fatalf("expected 1 left, got %d", len(left))
+	}
+}
+
+func TestTxWrapper(t *testing.T) {
+	ctx := context.Background()
+	if err := mydb.Init(mydb.Config{Driver: "sqlite", DSN: ":memory:"}); err != nil {
+		t.Fatalf("init sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = mydb.Close() })
+
+	fs := fstest.MapFS{
+		"sql/migrations/001_init.sql": {Data: []byte("CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);")},
+	}
+	if err := mydb.MigrateDir(ctx, fs, "sql/migrations"); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	// commit case
+	err := mydb.Tx(ctx, func(ctx context.Context, tx *gorm.DB) error {
+		return tx.Exec("INSERT INTO items(name) VALUES (?)", "ok").Error
+	})
+	if err != nil {
+		t.Fatalf("tx commit: %v", err)
+	}
+	// rollback case
+	err = mydb.Tx(ctx, func(ctx context.Context, tx *gorm.DB) error {
+		if err := tx.Exec("INSERT INTO items(name) VALUES (?)", "no").Error; err != nil {
+			return err
+		}
+		return errors.New("force rollback")
+	})
+	if err == nil {
+		t.Fatalf("expected rollback error")
+	}
+	// verify only 1 row exists
+	var cnt int64
+	if err := mydb.DB().Raw("SELECT COUNT(1) FROM items").Scan(&cnt).Error; err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if cnt != 1 {
+		t.Fatalf("expected 1 row after rollback, got %d", cnt)
 	}
 }

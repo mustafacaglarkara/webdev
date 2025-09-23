@@ -230,9 +230,9 @@ _ = c.GetJSON(ctx, "/v1/ping", &out)
 // Log alanları: method,url,status,dur,host + (varsa) cid, err/respb
 ```
 
-### Response Validation ve JSON Schema
+import "github.com/mustafacaglarkara/webdev/pkg/helpers"
 
-```go
+client, err := helpers.NewFTPClient("ftp.example.com:21", "kullanici", "sifre")
 // Tüm cevaplar için basit validator
 c := httpx.New(
     httpx.WithBaseURL("https://api.example.com"),
@@ -265,6 +265,57 @@ if err := c2.GetJSON(ctx, "/v1/items/123", &item); err != nil {
 
 ```go
 // NDJSON stream işle (her satır JSON)
+## SQL Loader/Templater (pkg/helpers/SQLLoader)
+
+Diskten veya embed.FS üzerinden .sql dosyalarını okuyup text/template ile render eder ve cache’ler.
+
+```go
+import (
+  "embed"
+  "github.com/mustafacaglarkara/webdev/pkg/helpers"
+)
+
+//go:embed sql/**/*.sql
+var sqlFS embed.FS
+
+l := helpers.NewSQLLoader(sqlFS, nil)
+_ = l.PreloadDir("sql") // opsiyonel, önceden cache’leme
+
+sqlText, _ := l.Load("sql/queries/select_user.sql", map[string]any{"Email":"a@b.com"})
+// SELECT id, email, name FROM users WHERE email = 'a@b.com'
+```
+
+Hazır fonksiyonlar: Load, LoadRaw, PreloadDir; varsayılan template func’lar: join, upper, lower, trim, title.
+
+## Arşiv ve E-posta Helper’ları (pkg/helpers)
+
+ZIP oluşturma/çıkarma, RAR/7z için CLI fallback ve SMTP ile ekli e-posta gönderimi.
+
+```go
+// ZIP
+_ = helpers.ZipDir("./data", "./data.zip")
+_ = helpers.ExtractZip("./data.zip", "./out")
+_ = helpers.CreateZipFromPaths([]string{"./README.md", "./pkg"}, "all.zip")
+
+// RAR/7z (sistemde unrar/7z kurulu olmalı)
+_ = helpers.ExtractRar("./a.rar", "./out")
+_ = helpers.Extract7z("./a.7z", "./out")
+
+// Email (SMTP)
+cfg := helpers.SMTPCfg{Host:"smtp.example.com", Port:587, User:"u", Pass:"p", UseTLS:true, Timeout:10*time.Second}
+ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+defer cancel()
+err := helpers.SendEmail(ctx, cfg,
+  "From <no-reply@example.com>",
+  []string{"to@example.com"}, nil, nil,
+  "Konu", "Text body", "<b>HTML body</b>",
+  []string{"./all.zip"},
+)
+```
+
+> Not: RAR/7z işlemleri için ilgili CLI araçlarının PATH’te olması gerekir (macOS için `brew install p7zip unrar`).
+
+
 _ = c.StreamNDJSON(ctx, "/v1/stream", nil, nil, func(raw json.RawMessage) error {
     var m map[string]any
     if err := json.Unmarshal(raw, &m); err != nil { return err }
@@ -519,3 +570,45 @@ _ = mydb.ExecReturningSQL(ctx, sqlFS, "sql/queries/insert_returning.sql", map[st
 go build ./...
 go test -v ./pkg/db
 ```
+
+## pkg/helpers/ftphelper – FTP Yardımcı Fonksiyonları
+
+Temel FTP işlemleri için kolay bir arayüz sağlar. (Bağlan, dosya yükle/indir, sil, listele, yeniden adlandır, dizin işlemleri)
+
+### Hızlı Başlangıç
+
+```go
+import "github.com/mustafacaglarkara/webdev/pkg/helpers/ftphelper"
+
+client, err := ftphelper.NewFTPClient("ftp.example.com:21", "kullanici", "sifre")
+if err != nil {
+    // hata yönetimi
+}
+defer client.Close()
+
+// Dosya yükle
+err = client.Upload("/remote/path.txt", []byte("merhaba ftp"))
+
+// Dosya indir
+veri, err := client.Download("/remote/path.txt")
+
+// Dosya sil
+err = client.Delete("/remote/path.txt")
+
+// Dizin listele
+entries, err := client.List("/")
+for _, e := range entries {
+    fmt.Println(e.Name, e.Type)
+}
+
+// Dosya adı değiştir
+err = client.Rename("/old.txt", "/new.txt")
+
+// Dizin oluştur
+err = client.MakeDir("/yeni_klasor")
+
+// Dizin sil
+err = client.RemoveDir("/yeni_klasor")
+```
+
+> Not: Testler için ortam değişkenlerinden FTP_ADDR, FTP_USER, FTP_PASS ayarlanmalı. Testler otomatik olarak upload, list, download, rename ve delete işlemlerini doğrular.
