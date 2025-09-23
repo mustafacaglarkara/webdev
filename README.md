@@ -352,3 +352,170 @@ go run ./cmd/main
 ## Notlar
 - `internal/helpers` build dışına alındı (`//go:build ignore`); dış projeler için `pkg/helpers` kullanın.
 - Ağ üzerinde çağrı yapan kodları (httpx) üretime almadan önce timeout, retry ve log politikalarıyla birlikte test edin.
+
+# pkg/db – Esnek GORM DB Helper (Postgres/MySQL/SQLite/SQL Server)
+
+Özellikler:
+- Init/DB/Close: tekil bağlantı havuzu
+- Migration: embed.FS veya diskten .sql dosyalarını sıralı/transaction’lı çalıştırma
+- Parametreli SQL: ${name} yer tutucu → güvenli `?` binding (dialect’e uygun)
+- IN-list binder: dilim/slice için `${ids}` → `(?, ?, ?)` + flatten; boş slice → `NULL`
+- Kısayollar: SelectSQL/InsertSQL/UpdateSQL/DeleteSQL (dosyadan), QueryString/ExecString/InsertString/...
+- Bulk: Insert, Upsert (PG/SQLite: ON CONFLICT; MySQL: ON DUPLICATE KEY; SQL Server: MERGE), Update by key (CASE WHEN)
+- Log/Tracing: süre, rows, kısaltılmış sql; context’ten trace_id/tx_id alanlarını alır; SlowThreshold ile yavaş sorgu işaretleme
+- Retry: tüm Exec/Raw çağrılarında otomatik tekrar
+- Circuit Breaker: peş peşe hatalarda devre kesici (open/half-open/closed)
+- RETURNING/OUTPUT kısayolları: tek çağrıda dönen kayıtları al
+
+### Hızlı Başlangıç
+
+```go
+package main
+
+import (
+  "context"
+  "embed"
+  "time"
+  mydb "github.com/mustafacaglarkara/webdev/pkg/db"
+  "github.com/mustafacaglarkara/webdev/pkg/logx"
+)
+
+//go:embed sql/**/*.sql
+var sqlFS embed.FS
+
+func main() {
+  // logger (opsiyonel)
+  logx.SetDefault(logx.New(logx.Config{Format: "json"}))
+
+  // Init + politikalar
+  _ = mydb.Init(mydb.Config{
+    Driver:        "postgres",
+    DSN:           "host=localhost port=5432 user=app password=app dbname=appdb sslmode=disable",
+    MaxOpenConns:  10,
+    MaxIdleConns:  5,
+    RetryAttempts: 3,
+    RetryDelay:    200 * time.Millisecond,
+    EnableLogging: true,
+    SlowThreshold: 300 * time.Millisecond,
+    EnableBreaker: true,
+    BreakerFailThreshold: 5,
+    BreakerOpenTimeout:   30 * time.Second,
+  })
+  defer mydb.Close()
+
+  ctx := mydb.WithTraceID(context.Background(), "req-123")
+
+  // Migration
+  _ = mydb.MigrateDir(ctx, sqlFS, "sql/migrations")
+
+  // Insert (dosyadan)
+  _, _ = mydb.InsertSQL(ctx, sqlFS, "sql/queries/insert_user.sql", map[string]any{"email": "a@b.com", "name": "Ada"})
+
+  // Select (metin SQL)
+  var users []struct{ ID int64; Email, Name string }
+  _ = mydb.QueryString(ctx, "SELECT id, email, name FROM users WHERE email = ${email}", map[string]any{"email":"a@b.com"}, &users)
+}
+```
+
+### SQL Dosyaları ve Parametreler
+- .sql içinde `${param}` yazın; helper güvenli şekilde `?` ve değerleri bağlar.
+- IN-list: `${ids}` değerine `[]int64{1,2,3}` verirseniz otomatik `IN (?,?,?)` + param flatten.
+
+```sql
+-- sql/queries/select_in.sql
+SELECT id, name FROM users WHERE id IN (${ids})
+```
+
+```go
+var out []struct{ ID int64; Name string }
+_ = mydb.SelectSQL(ctx, sqlFS, "sql/queries/select_in.sql", map[string]any{"ids": []int64{1,2,3}}, &out)
+```
+
+### Kısayollar
+- Dosyadan: `SelectSQL[T]`, `InsertSQL`, `UpdateSQL`, `DeleteSQL`
+- Metin SQL: `QueryString[T]`, `InsertString`, `UpdateString`, `DeleteString`, `ExecString`
+
+### Bulk İşlemler
+
+```go
+// Insert
+cols := []string{"email","name"}
+rows := [][]any{{"b@b.com","Bob"},{"c@b.com","Cem"}}
+_, _ = mydb.BulkInsertRows(ctx, "users", cols, rows, 0) // batchSize=0 => otomatik
+
+// Upsert
+_, _ = mydb.BulkUpsertRows(ctx, "users", cols, []string{"email"}, []string{"name"}, [][]any{{"b@b.com","Bobby"}}, 0)
+
+// Update by key (CASE WHEN)
+upd := []map[string]any{{"id":1, "name":"X"}, {"id":2, "name":"Y"}}
+_, _ = mydb.BulkUpdateByKey(ctx, "users", "id", []string{"name"}, upd, 0)
+```
+
+### SQL Server Upsert (MERGE)
+- `BulkUpsertRows` SQL Server’da otomatik `MERGE` üretir (conflictCols: PK/unique kolonlar, updateCols: güncellenecek kolonlar).
+
+### SQL Server MERGE (opsiyonlarla)
+
+```go
+opts := &mydb.UpsertOptions{
+  SQLServerTableHint: "WITH (HOLDLOCK)",    // tablo ipucu (opsiyonel)
+  SQLServerOutput:    "OUTPUT INSERTED.*", // ek / güncellenen satırları döndür (opsiyonel)
+}
+_, _ = mydb.BulkUpsertRowsWithOptions(ctx,
+  "dbo.users",
+  []string{"email","name"},       // cols
+  []string{"email"},               // conflict / key cols
+  []string{"name"},                // update cols
+  [][]any{{"a@b.com","Ada"}},    // rows
+  0,
+  opts,
+)
+```
+
+Not: Output kullanıyorsanız dönen satırları Scan etmek için `ExecReturningString`/`ExecReturningSQL` ile eşdeğer SELECT yazabilir veya `SQLServerOutput` ile birlikte raw Exec’in etkilediği satırları ayrı bir SELECT ile okuyabilirsiniz.
+
+### Log’larda bağlantı etiketi ve veritabanı adı
+
+```go
+_ = mydb.Init(mydb.Config{
+  Driver:        "postgres",
+  DSN:           "...",
+  EnableLogging: true,
+  ConnLabel:     "primary",     // log alanı: conn=primary
+  DatabaseName:  "appdb",       // log alanı: db=appdb
+})
+```
+
+Log alanları: kind, elapsed, args, rows, sql (kısaltılmış) + varsa trace_id, tx_id, conn, db
+
+### Log/Tracing ve Yavaş Sorgu Eşiği
+- `EnableLogging: true` ile her Exec/Raw’da: `kind, elapsed, args, rows, sql(<=200)`, varsa `trace_id`, `tx_id` loglanır.
+- `SlowThreshold` üzerinde sürenler `slow: true` olarak işaretlenir.
+- `WithTraceID(ctx, id)`, `WithTxID(ctx, id)` ile context’e alan ekleyin.
+
+### Retry ve Circuit Breaker
+- `RetryAttempts`/`RetryDelay` ile her çağrı otomatik retry.
+- `EnableBreaker` + `BreakerFailThreshold` + `BreakerOpenTimeout` ile devre kesici; açıkken çağrılar `helpers.ErrBreakerOpen` ile dönebilir.
+
+### RETURNING / OUTPUT Kısayolları
+- Tek SQL ile veri dönmek isterseniz kısayolları kullanın.
+
+```go
+// Postgres RETURNING örneği (metin SQL)
+var ids []struct{ ID int64 }
+_ = mydb.ExecReturningString(ctx, "INSERT INTO users(email,name) VALUES (${e},${n}) RETURNING id", map[string]any{"e":"z@x","n":"Z"}, &ids)
+
+// Dosyadan sürüm
+_ = mydb.ExecReturningSQL(ctx, sqlFS, "sql/queries/insert_returning.sql", map[string]any{"e":"z@x","n":"Z"}, &ids)
+```
+
+### Migration
+- `MigrateDir(ctx, fs, "sql/migrations")` `.sql` dosyalarını ada göre sıralayıp tek transaction’da uygular.
+
+### Hızlı Deneme
+
+```bash
+# Derle ve test et
+go build ./...
+go test -v ./pkg/db
+```
