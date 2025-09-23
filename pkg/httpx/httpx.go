@@ -443,7 +443,7 @@ func (c *Client) exchangeJSON(ctx context.Context, method, path string, params u
 					}
 				}
 				if out != nil {
-					if derr := json.Unmarshal(body, &out); derr != nil {
+					if derr := json.Unmarshal(body, out); derr != nil {
 						err = derr
 						return
 					}
