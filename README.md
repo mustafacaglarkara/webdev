@@ -651,3 +651,68 @@ err = client.RemoveDir("/yeni_klasor")
 ```
 
 > Not: Testler için ortam değişkenlerinden FTP_ADDR, FTP_USER, FTP_PASS ayarlanmalı. Testler otomatik olarak upload, list, download, rename ve delete işlemlerini doğrular.
+
+# Migration ve Seed Helper Kullanımı
+
+## Migration
+
+```go
+import (
+    "database/sql"
+    _ "github.com/lib/pq" // veya kullandığın driver
+    "calisma_go/pkg/migrate"
+)
+
+func main() {
+    db, _ := sql.Open("postgres", "postgres://user:pass@localhost:5432/dbname?sslmode=disable")
+    defer db.Close()
+    // Migration çalıştır
+    err := migrate.Migrate(db, "./migrations")
+    if err != nil {
+        panic(err)
+    }
+    // Rollback
+    // err := migrate.RollbackMigrations(db, "./migrations")
+}
+```
+
+## Seed
+
+```go
+import (
+    "database/sql"
+    _ "github.com/lib/pq"
+    "calisma_go/pkg/seeder"
+)
+
+func main() {
+    db, _ := sql.Open("postgres", "postgres://user:pass@localhost:5432/dbname?sslmode=disable")
+    defer db.Close()
+    // Seed çalıştır
+    err := seeder.RunSeeds(db, seeder.SeedUsers)
+    if err != nil {
+        panic(err)
+    }
+}
+```
+
+## Klasör Yapısı
+
+```
+calisma_go/
+│── pkg/
+│    ├── migrate/
+│    │     └── migrate.go
+│    ├── seeder/
+│    │     ├── seeder.go
+│    │     └── users_seed.go
+│── migrations/
+│    ├── 000001_create_users_table.up.sql
+│    └── 000001_create_users_table.down.sql
+```
+
+## Notlar
+- Migration dosyalarını `migrations/` altında .up.sql ve .down.sql olarak tut.
+- Seed fonksiyonlarını `pkg/seeder/` altında tanımla.
+- Her projede sadece config ve seed fonksiyonlarını eklemen yeterli.
+- Gelişmiş log, config, db helper entegrasyonu için pkg altında ilgili helperları kullanabilirsin.
