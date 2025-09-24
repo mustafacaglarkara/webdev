@@ -716,3 +716,48 @@ calisma_go/
 - Seed fonksiyonlarını `pkg/seeder/` altında tanımla.
 - Her projede sadece config ve seed fonksiyonlarını eklemen yeterli.
 - Gelişmiş log, config, db helper entegrasyonu için pkg altında ilgili helperları kullanabilirsin.
+
+# Şifreleme ve Bearer Token Helper Kullanımı
+
+## Kullanıcı adı/şifre ile Bearer token üretimi
+
+```go
+import (
+    "github.com/mustafacaglarkara/webdev/pkg/helpers"
+    "time"
+)
+
+// Basit base64 ile token
+bearer, _ := helpers.GenerateBearerTokenFromCredentials("user1", "pass1")
+// Çözümleme
+u, p, valid, err := helpers.ParseBearerToken(bearer)
+
+// AES ile şifreli token
+bearer, _ = helpers.GenerateBearerTokenFromCredentials("user1", "pass1", helpers.WithAESKey("mysecretkey"), helpers.WithExpiry(10*time.Minute), helpers.WithPrefix("Bearer"))
+u, p, valid, err = helpers.ParseBearerToken(bearer, helpers.WithAESKey("mysecretkey"), helpers.WithPrefix("Bearer"))
+
+// HMAC ile imzalı token
+bearer, _ = helpers.GenerateBearerTokenFromCredentials("user1", "pass1", helpers.WithHMACKey("hmacsecret"), helpers.WithExpiry(5*time.Minute))
+u, p, valid, err = helpers.ParseBearerToken(bearer, helpers.WithHMACKey("hmacsecret"))
+
+// Token süresi dolduğunda valid=false ve hata döner
+```
+
+## Diğer şifreleme yardımcıları
+
+```go
+// Parola hash ve doğrulama
+hash, _ := helpers.HashPassword("parola123")
+valid := helpers.CheckPassword(hash, "parola123")
+
+// Rastgele Bearer token
+token, _ := helpers.GenerateBearerToken(32)
+
+// AES ile metin şifreleme
+enc, _ := helpers.EncryptAESGCM("gizli veri", "anahtar")
+dec, _ := helpers.DecryptAESGCM(enc, "anahtar")
+
+// HMAC ile imzalama
+sig := helpers.HMACSign("mesaj", "anahtar")
+valid := helpers.HMACVerify("mesaj", "anahtar", sig)
+```
