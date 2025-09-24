@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -44,6 +45,9 @@ type Config struct {
 	// Bağlantı etiketleri (loglar için)
 	ConnLabel    string // örn. "primary" veya "reporting"
 	DatabaseName string // isteğe bağlı; loglara eklenir
+	// Prepared statement & cache (opsiyonel)
+	EnableStmtCache bool // true ise PrepareCached kullanılır
+	StmtCacheSize   int  // 0 veya <0 => sınırsız (LRU yok basit map)
 }
 
 var (
@@ -51,6 +55,10 @@ var (
 	defaultDB  *gorm.DB
 	defaultCfg Config
 	cb         *helpers.CircuitBreaker
+	stmtMu     sync.RWMutex
+	// maps concrete bound SQL (with ? placeholders) -> prepared *sql.Stmt
+	stmtCache   = make(map[string]*sql.Stmt)
+	stmtMetrics = struct{ prepares, hits int64 }{}
 )
 
 // Init: config ile global DB’yi hazırlar. Tek sefer çağrılmalıdır.
@@ -91,7 +99,121 @@ func Close() error {
 	}
 	err := closeDB(defaultDB)
 	defaultDB = nil
+	// close and clear stmt cache
+	stmtMu.Lock()
+	for k, s := range stmtCache {
+		if s != nil {
+			_ = s.Close()
+		}
+		delete(stmtCache, k)
+	}
+	stmtMu.Unlock()
 	return err
+}
+
+// PrepareCached: psuedo-prepare (gorm zaten driver prepare kullanır). Bu fonksiyon sadece sorgu metnini cache'ler ve kullanım sayaçları tutar.
+// Eğer gerçek *sql.Stmt gereksinimi oluşursa database/sql seviyesinde yönetmek gerekir.
+// prepareAndCache prepares a *sql.Stmt for the concrete bound SQL (with ? placeholders)
+// and stores it into stmtCache. Returns the prepared stmt (or nil if caching disabled).
+func prepareAndCache(bound string) (*sql.Stmt, error) {
+	if !defaultCfg.EnableStmtCache {
+		return nil, nil
+	}
+	// fast path: read lock
+	stmtMu.RLock()
+	if s, ok := stmtCache[bound]; ok {
+		stmtMetrics.hits++
+		stmtMu.RUnlock()
+		return s, nil
+	}
+	stmtMu.RUnlock()
+
+	mu.RLock()
+	db := defaultDB
+	mu.RUnlock()
+	if db == nil {
+		return nil, errors.New("db.Init çağrılmamış")
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, err
+	}
+	s, err := sqlDB.PrepareContext(context.Background(), bound)
+	if err != nil {
+		return nil, err
+	}
+
+	stmtMu.Lock()
+	// double-check another goroutine didn't prepare concurrently
+	if existing, ok := stmtCache[bound]; ok {
+		_ = s.Close()
+		stmtMetrics.hits++
+		stmtMu.Unlock()
+		return existing, nil
+	}
+	stmtCache[bound] = s
+	stmtMetrics.prepares++
+	// simple prune if size limit set: remove one arbitrary entry
+	if defaultCfg.StmtCacheSize > 0 && len(stmtCache) > defaultCfg.StmtCacheSize {
+		for k, v := range stmtCache {
+			if k == bound {
+				continue
+			}
+			_ = v.Close()
+			delete(stmtCache, k)
+			break
+		}
+	}
+	stmtMu.Unlock()
+	return s, nil
+}
+
+// StmtMetrics: prepare/hit sayaçlarını döner.
+func StmtMetrics() (prepares, hits int64) {
+	stmtMu.RLock()
+	prepares = stmtMetrics.prepares
+	hits = stmtMetrics.hits
+	stmtMu.RUnlock()
+	return
+}
+
+// ExecPrepared: PrepareCached üzerinden geçen sorguyu çalıştırır.
+// ExecPrepared: tries to prepare the concrete SQL and execute via *sql.Stmt when enabled.
+func ExecPrepared(ctx context.Context, sqlText string, params map[string]any) (int64, error) {
+	db := DB()
+	if db == nil {
+		return 0, errors.New("db.Init çağrılmamış")
+	}
+	ctx = ensureQueryID(ctx)
+	bound, args, err := bindNamedToQ(sqlText, params)
+	if err != nil {
+		return 0, err
+	}
+	// try prepare + exec via *sql.Stmt
+	s, perr := prepareAndCache(bound)
+	if perr == nil && s != nil {
+		res, err := s.ExecContext(ctx, args...)
+		if err != nil {
+			return 0, err
+		}
+		ra, _ := res.RowsAffected()
+		return ra, nil
+	}
+	// fallback to normal ExecString path
+	var rows int64
+	start := time.Now()
+	err = doWithPolicies(ctx, func() error {
+		res := db.WithContext(ctx).Exec(bound, args...)
+		rows = res.RowsAffected
+		return res.Error
+	})
+	logExec(ctx, "exec", bound, args, start, err, rows)
+	return rows, err
+}
+
+// QueryPrepared: currently delegates to QueryString (prepared scanning not implemented)
+func QueryPrepared[T any](ctx context.Context, sqlText string, params map[string]any, dest *[]T) error {
+	return QueryString[T](ctx, sqlText, params, dest)
 }
 
 // UpsertOptions: özellikle SQL Server MERGE için ipuçları
@@ -813,6 +935,10 @@ func logExec(ctx context.Context, kind string, sqlText string, args []any, start
 	}
 	if defaultCfg.SlowThreshold > 0 && elapsed > defaultCfg.SlowThreshold {
 		attrs = append(attrs, "slow", true)
+	}
+	if defaultCfg.EnableStmtCache {
+		prepares, hits := StmtMetrics()
+		attrs = append(attrs, "prep", prepares, "hit", hits)
 	}
 	if err != nil {
 		logger.Error("db.exec", append(attrs, "err", err.Error())...)
