@@ -315,6 +315,22 @@ err := helpers.SendEmail(ctx, cfg,
 
 > Not: RAR/7z işlemleri için ilgili CLI araçlarının PATH’te olması gerekir (macOS için `brew install p7zip unrar`).
 
+#### Email rate limiting & retry
+
+`helpers.SMTPCfg` artık opsiyonel olarak rate limiting ve retry seçeneklerini destekler:
+
+```go
+cfg := helpers.SMTPCfg{
+    Host: "smtp.example.com", Port: 587, User: "user", Pass: "pass", UseTLS: true,
+    Timeout: 5 * time.Second,
+    RateInterval: time.Minute, RateMax: 30,          // pencere başına max 30 gönderim
+    RetryAttempts: 3, RetryDelay: 2 * time.Second,  // geçici hatalarda 3 deneme
+}
+_ = helpers.SendEmail(ctx, cfg, from, to, cc, bcc, subject, text, html, attachments)
+```
+
+Geçici hata tespiti: network timeout/temporary hatalar ve SMTP 4xx kodları için otomatik retry yapılır.
+
 
 _ = c.StreamNDJSON(ctx, "/v1/stream", nil, nil, func(raw json.RawMessage) error {
     var m map[string]any
@@ -547,6 +563,29 @@ Log alanları: kind, elapsed, args, rows, sql (kısaltılmış) + varsa trace_id
 ### Retry ve Circuit Breaker
 - `RetryAttempts`/`RetryDelay` ile her çağrı otomatik retry.
 - `EnableBreaker` + `BreakerFailThreshold` + `BreakerOpenTimeout` ile devre kesici; açıkken çağrılar `helpers.ErrBreakerOpen` ile dönebilir.
+
+### Prepared statement cache & metrikler
+
+`db.Config` artık opsiyonel olarak prepared statement cache ayarlarını destekler:
+
+- `EnableStmtCache bool`
+- `StmtCacheSize int` (0 veya negatif => sınırsız, pozitif => basit en-eski-prune)
+
+Kullanım örneği:
+
+```go
+_ = mydb.Init(mydb.Config{Driver: "postgres", DSN: dsn, EnableStmtCache: true, StmtCacheSize: 200})
+
+// ExecPrepared / QueryPrepared
+_, _ = mydb.ExecPrepared(ctx, "UPDATE users SET last_login=${ts} WHERE id=${id}", map[string]any{"ts": time.Now(), "id": 42})
+var out []User
+_ = mydb.QueryPrepared(ctx, "SELECT id,email FROM users WHERE status=${st}", map[string]any{"st": "ACTIVE"}, &out)
+
+// Metrikler
+prepares, hits := mydb.StmtMetrics()
+```
+
+Loglar (EnableLogging) içinde `prep` ve `hit` alanları görüntülenir.
 
 ### RETURNING / OUTPUT Kısayolları
 - Tek SQL ile veri dönmek isterseniz kısayolları kullanın.

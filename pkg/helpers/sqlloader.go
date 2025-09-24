@@ -3,8 +3,11 @@ package helpers
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io/fs"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"text/template"
@@ -25,6 +28,94 @@ func defaultSQLFuncs() template.FuncMap {
 		"lower": strings.ToLower,
 		"trim":  strings.TrimSpace,
 		"title": strings.Title,
+		// DSL helpers
+		"whereJoin": func(sep string, parts ...string) string { // sep genelde AND / OR
+			cleaned := make([]string, 0, len(parts))
+			for _, p := range parts {
+				p = strings.TrimSpace(p)
+				if p != "" {
+					cleaned = append(cleaned, p)
+				}
+			}
+			if len(cleaned) == 0 {
+				return ""
+			}
+			if sep == "" {
+				sep = "AND"
+			}
+			return "WHERE " + strings.Join(cleaned, " "+sep+" ")
+		},
+		"andJoin": func(parts ...string) string { // WHERE a AND b
+			return defaultSQLFuncs()["whereJoin"].(func(string, ...string) string)("AND", parts...)
+		},
+		"orJoin": func(parts ...string) string { // WHERE a OR b
+			return defaultSQLFuncs()["whereJoin"].(func(string, ...string) string)("OR", parts...)
+		},
+		// inList: slice/array -> "IN (?,?,?,...)"; boş ise her zaman FALSE (1=0) döner, tek eleman => "= ?"
+		"inList": func(col string, anySlice any) string {
+			if col == "" {
+				return ""
+			}
+			if anySlice == nil {
+				return "1=0" // nil => boş kabul
+			}
+			v := reflect.ValueOf(anySlice)
+			if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {
+				return fmt.Sprintf("%s = ?", col)
+			}
+			n := v.Len()
+			if n == 0 {
+				return "1=0"
+			}
+			if n == 1 {
+				return fmt.Sprintf("%s = ?", col)
+			}
+			return fmt.Sprintf("%s IN (%s)", col, strings.TrimRight(strings.Repeat("?,", n), ","))
+		},
+		// setList: map[string]any -> "SET col1=?, col2=?" sabit sıralama (alfabetik)
+		"setList": func(m map[string]any) string {
+			if len(m) == 0 {
+				return ""
+			}
+			keys := make([]string, 0, len(m))
+			for k := range m {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			var b strings.Builder
+			b.WriteString("SET ")
+			for i, k := range keys {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(k)
+				b.WriteString("=?")
+			}
+			return b.String()
+		},
+		// spOutDecl: SQL Server SP OUT param deklarasyonu -> @name TYPE OUTPUT
+		"spOutDecl": func(name, typ string) string {
+			name = strings.TrimSpace(name)
+			typ = strings.TrimSpace(typ)
+			if name == "" || typ == "" {
+				return ""
+			}
+			if !strings.HasPrefix(name, "@") {
+				name = "@" + name
+			}
+			return fmt.Sprintf("%s %s OUTPUT", name, typ)
+		},
+		// spOutVal: sadece @name değerini döner (örn. SELECT @name)
+		"spOutVal": func(name string) string {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				return ""
+			}
+			if !strings.HasPrefix(name, "@") {
+				name = "@" + name
+			}
+			return name
+		},
 	}
 }
 

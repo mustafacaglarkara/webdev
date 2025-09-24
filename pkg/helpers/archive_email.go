@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/smtp"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jordan-wright/email"
@@ -206,10 +208,66 @@ type SMTPCfg struct {
 	Pass    string
 	UseTLS  bool
 	Timeout time.Duration
+	// Rate limiting (opsiyonel)
+	RateInterval time.Duration // pencere
+	RateMax      int           // pencere başına izin verilen max gönderim (<=0 ise limitsiz)
+	// Retry (opsiyonel)
+	RetryAttempts int           // 1 veya 0 => retry yok
+	RetryDelay    time.Duration // sabit gecikme
+}
+
+var (
+	emailRateMu          sync.Mutex
+	emailRateWindowStart time.Time
+	emailRateCount       int
+)
+
+func allowEmailSend(cfg SMTPCfg) bool {
+	if cfg.RateMax <= 0 || cfg.RateInterval <= 0 {
+		return true
+	}
+	now := time.Now()
+	emailRateMu.Lock()
+	defer emailRateMu.Unlock()
+	if emailRateWindowStart.IsZero() || now.Sub(emailRateWindowStart) > cfg.RateInterval {
+		emailRateWindowStart = now
+		emailRateCount = 0
+	}
+	if emailRateCount >= cfg.RateMax {
+		return false
+	}
+	emailRateCount++
+	return true
+}
+
+// SMTP geçici hata tespiti: bazı network / 4xx kodlar tekrar denenebilir
+func isTransientSMTPError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// net hataları (timeout vs) -> transient
+	var nerr net.Error
+	if errors.As(err, &nerr) {
+		if nerr.Timeout() || nerr.Temporary() {
+			return true
+		}
+	}
+	es := err.Error()
+	// 4xx geçici SMTP kodları
+	if strings.Contains(es, " 421") || strings.Contains(es, " 450") || strings.Contains(es, " 451") || strings.Contains(es, " 452") {
+		return true
+	}
+	if strings.Contains(strings.ToLower(es), "timeout") {
+		return true
+	}
+	return false
 }
 
 // SendEmail ekli e-posta gönderir. text/html gövde desteklidir. Context timeout/cancel saygı gösterilir.
 func SendEmail(ctx context.Context, cfg SMTPCfg, from string, to, cc, bcc []string, subject string, textBody, htmlBody string, attachments []string) error {
+	if !allowEmailSend(cfg) {
+		return errors.New("email rate limit exceeded")
+	}
 	e := email.NewEmail()
 	e.From = from
 	e.To = to
@@ -240,24 +298,52 @@ func SendEmail(ctx context.Context, cfg SMTPCfg, from string, to, cc, bcc []stri
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	auth := smtp.PlainAuth("", cfg.User, cfg.Pass, cfg.Host)
 
-	done := make(chan error, 1)
-	go func() {
-		if cfg.UseTLS {
-			done <- e.SendWithTLS(addr, auth, &tls.Config{ServerName: cfg.Host})
-			return
+	attempts := cfg.RetryAttempts
+	if attempts <= 1 {
+		attempts = 1
+	}
+	delay := cfg.RetryDelay
+	if delay <= 0 {
+		delay = 2 * time.Second
+	}
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		attemptCtx := ctx
+		var cancel context.CancelFunc = func() {}
+		if cfg.Timeout > 0 {
+			attemptCtx, cancel = context.WithTimeout(ctx, cfg.Timeout)
 		}
-		done <- e.Send(addr, auth)
-	}()
-
-	if cfg.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, cfg.Timeout)
-		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			if cfg.UseTLS {
+				done <- e.SendWithTLS(addr, auth, &tls.Config{ServerName: cfg.Host})
+				return
+			}
+			done <- e.Send(addr, auth)
+		}()
+		select {
+		case <-attemptCtx.Done():
+			lastErr = attemptCtx.Err()
+			cancel()
+		case err := <-done:
+			if err == nil {
+				cancel()
+				return nil
+			}
+			lastErr = err
+			cancel()
+			if !isTransientSMTPError(err) {
+				return err
+			}
+		}
+		// tekrar dene
+		if i < attempts-1 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+		}
 	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-done:
-		return err
-	}
+	return lastErr
 }
