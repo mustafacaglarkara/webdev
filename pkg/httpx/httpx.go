@@ -18,7 +18,8 @@ import (
 
 	"github.com/xeipuuv/gojsonschema"
 
-	"github.com/mustafacaglarkara/webdev/pkg/helpers"
+	"github.com/mustafacaglarkara/webdev/pkg/fs"
+	"github.com/mustafacaglarkara/webdev/pkg/id"
 )
 
 // Client yapılandırması
@@ -382,7 +383,7 @@ func (c *Client) doJSONWith(ctx context.Context, method, path string, params url
 			h = "X-Correlation-ID"
 		}
 		if req.Header.Get(h) == "" {
-			req.Header.Set(h, helpers.MustUUIDv4())
+			req.Header.Set(h, id.MustUUIDv4())
 		}
 	}
 	resp, err := c.Do(ctx, req)
@@ -632,7 +633,7 @@ func (c *Client) logToFile(success bool, req *http.Request, status int, start ti
 		sub = "success"
 	}
 	dir := filepath.Join(c.LogDir, sub)
-	_ = helpers.EnsureDir(dir)
+	_ = fs.EnsureDir(dir)
 	fname := time.Now().Format("2006-01-02") + ".txt"
 	p := filepath.Join(dir, fname)
 	urlStr, host := "", ""
@@ -941,7 +942,7 @@ func (c *Client) DownloadToFile(ctx context.Context, path string, params url.Val
 		c.logToFile(false, req, resp.StatusCode, time.Now(), b, "", "")
 		return &HTTPError{StatusCode: resp.StatusCode, Body: b}
 	}
-	if err := helpers.EnsureDir(filepath.Dir(dst)); err != nil {
+	if err := fs.EnsureDir(filepath.Dir(dst)); err != nil {
 		return err
 	}
 	f, err := os.Create(dst)
@@ -978,7 +979,7 @@ func (c *Client) UploadStream(ctx context.Context, method, path string, params u
 			h = "X-Correlation-ID"
 		}
 		if req.Header.Get(h) == "" {
-			req.Header.Set(h, helpers.MustUUIDv4())
+			req.Header.Set(h, id.MustUUIDv4())
 		}
 	}
 	resp, err := c.Do(ctx, req)

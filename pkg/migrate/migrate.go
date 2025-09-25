@@ -1,21 +1,25 @@
-package main
+package migrate
 
 import (
 	"database/sql"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Migrate: .up.sql dosyalarını çalıştırır
 func Migrate(db *sql.DB, migrationsDir string) error {
-	files, err := ioutil.ReadDir(migrationsDir)
+	files, err := os.ReadDir(migrationsDir)
 	if err != nil {
 		return fmt.Errorf("migrations klasörü okunamadı: %w", err)
 	}
 	for _, f := range files {
-		if filepath.Ext(f.Name()) == ".up.sql" {
-			content, err := ioutil.ReadFile(filepath.Join(migrationsDir, f.Name()))
+		if f.IsDir() {
+			continue
+		}
+		if strings.HasSuffix(strings.ToLower(f.Name()), ".up.sql") {
+			content, err := os.ReadFile(filepath.Join(migrationsDir, f.Name()))
 			if err != nil {
 				return fmt.Errorf("dosya okunamadı: %w", err)
 			}
@@ -30,13 +34,16 @@ func Migrate(db *sql.DB, migrationsDir string) error {
 
 // Rollback: .down.sql dosyalarını çalıştırır
 func RollbackMigrations(db *sql.DB, migrationsDir string) error {
-	files, err := ioutil.ReadDir(migrationsDir)
+	files, err := os.ReadDir(migrationsDir)
 	if err != nil {
 		return fmt.Errorf("migrations klasörü okunamadı: %w", err)
 	}
 	for _, f := range files {
-		if filepath.Ext(f.Name()) == ".down.sql" {
-			content, err := ioutil.ReadFile(filepath.Join(migrationsDir, f.Name()))
+		if f.IsDir() {
+			continue
+		}
+		if strings.HasSuffix(strings.ToLower(f.Name()), ".down.sql") {
+			content, err := os.ReadFile(filepath.Join(migrationsDir, f.Name()))
 			if err != nil {
 				return fmt.Errorf("dosya okunamadı: %w", err)
 			}

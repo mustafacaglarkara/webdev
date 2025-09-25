@@ -23,8 +23,8 @@ import (
 
 	// logging & retry
 	"github.com/google/uuid"
-	"github.com/mustafacaglarkara/webdev/pkg/helpers"
 	"github.com/mustafacaglarkara/webdev/pkg/logx"
+	"github.com/mustafacaglarkara/webdev/pkg/resilience"
 )
 
 type Config struct {
@@ -54,7 +54,7 @@ var (
 	mu         sync.RWMutex
 	defaultDB  *gorm.DB
 	defaultCfg Config
-	cb         *helpers.CircuitBreaker
+	cb         *resilience.CircuitBreaker
 	stmtMu     sync.RWMutex
 	// maps concrete bound SQL (with ? placeholders) -> prepared *sql.Stmt
 	stmtCache   = make(map[string]*sql.Stmt)
@@ -76,7 +76,7 @@ func Init(cfg Config) error {
 	defaultDB = db
 	defaultCfg = cfg
 	if cfg.EnableBreaker {
-		cb = helpers.NewCircuitBreaker(cfg.BreakerFailThreshold, cfg.BreakerOpenTimeout)
+		cb = resilience.NewCircuitBreaker(cfg.BreakerFailThreshold, cfg.BreakerOpenTimeout)
 	} else {
 		cb = nil
 	}
@@ -904,7 +904,7 @@ func doWithRetry(ctx context.Context, fn func() error) error {
 		return fn()
 	}
 	delay := defaultCfg.RetryDelay
-	return helpers.Retry(ctx, attempts, delay, fn)
+	return resilience.Retry(ctx, attempts, delay, fn)
 }
 
 func logExec(ctx context.Context, kind string, sqlText string, args []any, start time.Time, err error, affected int64) {
