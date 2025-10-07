@@ -62,6 +62,28 @@ sql, err := loader.LoadNamed("queries/product.sql", "listProducts", map[string]a
 
 ---
 
+## Otomatik OUT Parametre Toplama (SQL Server)
+
+Stored procedure OUT parametrelerini tek yerde tanımlayıp EXEC ve SELECT bölümlerini otomatik üretebilirsiniz. Kullanılan template fonksiyonları: `list`, `dict`, `spOutDecls`, `spOutVals`.
+
+Örnek template:
+```sql
+{{ $outs := list (dict "name" "o_id" "type" "INT" "alias" "id") (dict "name" "o_msg" "type" "NVARCHAR(100)" "alias" "message") }}
+EXEC MyProc {{ spOutDecls $outs }};
+SELECT {{ spOutVals $outs }};
+```
+
+Açıklama:
+- `list`: Elemanlardan slice oluşturur.
+- `dict`: key/value çiftlerinden map oluşturur (name, type, alias).
+- `spOutDecls`: EXEC çağrısı için `@name TYPE OUTPUT` listesini üretir.
+- `spOutVals`: SELECT için `@name AS alias` listesini üretir; alias boş ise `name`'in `@` işareti atılmış hali kullanılır.
+
+Desteklenen veri tipleri:
+- `[]map[string]any`, `[]map[string]string` veya `[]struct{Name,Type,Alias string}`.
+
+---
+
 ## GORM ile Kullanım
 
 sqlutil ile üretilen SQL sorgularını GORM ile kullanabilirsiniz:
@@ -147,5 +169,6 @@ raw, err := loader.LoadRaw("queries/raw.sql")
 - Parametreler map veya struct olarak verilebilir.
 - PreloadDir ile tüm SQL'ler baştan parse edilip cache'lenir.
 - inList, setList gibi fonksiyonlar edge-case'lerde güvenli sonuç döner.
+- Otomatik OUT parametre toplama için `spOutDecls` ve `spOutVals` fonksiyonlarını kullanın.
 - sqlutil ile üretilen SQL'ler GORM ile doğrudan kullanılabilir.
 - Daha fazla detay için kodu ve testleri inceleyin.

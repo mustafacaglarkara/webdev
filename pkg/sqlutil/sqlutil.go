@@ -111,6 +111,57 @@ func defaultSQLFuncs() template.FuncMap {
 			}
 			return name
 		},
+		"list": func(args ...any) []any { return args },
+		"dict": func(kv ...any) map[string]any {
+			m := make(map[string]any)
+			for i := 0; i+1 < len(kv); i += 2 {
+				k, ok := kv[i].(string)
+				if !ok {
+					continue
+				}
+				m[k] = kv[i+1]
+			}
+			return m
+		},
+		"spOutDecls": func(arr any) string {
+			items := normalizeOutParams(arr)
+			if len(items) == 0 {
+				return ""
+			}
+			var b strings.Builder
+			for i, it := range items {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				name := ensureAtPrefix(it.Name)
+				b.WriteString(name)
+				b.WriteString(" ")
+				b.WriteString(strings.TrimSpace(it.Type))
+				b.WriteString(" OUTPUT")
+			}
+			return b.String()
+		},
+		"spOutVals": func(arr any) string {
+			items := normalizeOutParams(arr)
+			if len(items) == 0 {
+				return ""
+			}
+			var b strings.Builder
+			for i, it := range items {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				name := ensureAtPrefix(it.Name)
+				alias := it.Alias
+				if alias == "" {
+					alias = strings.TrimPrefix(it.Name, "@")
+				}
+				b.WriteString(name)
+				b.WriteString(" AS ")
+				b.WriteString(alias)
+			}
+			return b.String()
+		},
 	}
 }
 
@@ -240,4 +291,80 @@ func parseNamedQueries(content string) map[string]string {
 	}
 	flush()
 	return queries
+}
+
+// Yardımcı: OUT parametre öğesini normalize etmek için yapı
+type outParam struct{ Name, Type, Alias string }
+
+// normalizeOutParams: şunları destekler: []map[string]any, []map[string]string, slice of struct{Name,Type,Alias}
+func normalizeOutParams(v any) []outParam {
+	rv := reflect.ValueOf(v)
+	if !rv.IsValid() {
+		return nil
+	}
+	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
+		return nil
+	}
+	res := make([]outParam, 0, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		e := rv.Index(i).Interface()
+		switch t := e.(type) {
+		case map[string]any:
+			res = append(res, outParam{
+				Name:  toString(t["name"]),
+				Type:  toString(t["type"]),
+				Alias: toString(t["alias"]),
+			})
+		case map[string]string:
+			res = append(res, outParam{
+				Name:  t["name"],
+				Type:  t["type"],
+				Alias: t["alias"],
+			})
+		default:
+			// try struct fields Name, Type, Alias
+			rve := reflect.ValueOf(e)
+			rte := reflect.Indirect(rve)
+			if rte.IsValid() && rte.Kind() == reflect.Struct {
+				get := func(field string) string {
+					f := rte.FieldByName(field)
+					if f.IsValid() {
+						return toString(f.Interface())
+					}
+					return ""
+				}
+				res = append(res, outParam{Name: get("Name"), Type: get("Type"), Alias: get("Alias")})
+			}
+		}
+	}
+	// filtre: adı ve tipi olanları al
+	out := res[:0]
+	for _, it := range res {
+		if strings.TrimSpace(it.Name) != "" && strings.TrimSpace(it.Type) != "" {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+func toString(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case []byte:
+		return string(x)
+	default:
+		return strings.TrimSpace(fmt.Sprintf("%v", v))
+	}
+}
+
+func ensureAtPrefix(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	if strings.HasPrefix(s, "@") {
+		return s
+	}
+	return "@" + s
 }

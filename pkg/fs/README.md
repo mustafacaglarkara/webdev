@@ -42,6 +42,24 @@ _ = fs.Remove("dosya.txt")
 files, _ := fs.ListDirFiles("klasor")
 ```
 
+### Upload Doğrulama (Uzantı ve MIME)
+
+#### Uzantı Kontrolü
+```go
+ok := fs.IsAllowedExtension("resim.JPG", []string{".jpg", "png", "webp"}) // true
+```
+
+#### MIME Tipi Tespiti ve Doğrulama
+```go
+mime, _ := fs.DetectMIMEFromFile("resim.jpg") // örn: "image/jpeg"
+allowed, detected, _ := fs.IsAllowedMIMEFromFile("resim.jpg", []string{"image/", "application/pdf"})
+// allowed, detected => true, "image/jpeg"
+```
+
+Notlar:
+- Uzantı kontrolünde noktalı veya noktasız değerler kullanılabilir (case-insensitive).
+- MIME doğrulamada baştan eşleşme kabul edilir (ör: "image/" tüm image türlerini kapsar).
+
 ### Arşivleme (ZIP, RAR, 7z)
 
 #### Klasörü ZIP'e Arşivleme

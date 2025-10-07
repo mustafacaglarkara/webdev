@@ -35,18 +35,26 @@ func main() {
 }
 ```
 
+### ToSlugForFile
+Dosya adları için güvenli slug üretir, son uzantıyı korur.
+
+```go
+fmt.Println(text.ToSlugForFile("Çılgın Fotoğraf(1).JPG")) // cilgin-fotograf-1.jpg
+fmt.Println(text.ToSlugForFile("rapor.v1.2.PDF"))         // rapor-v1-2.pdf
+```
+
 ### ReverseString
 Unicode (rune-safe) olarak string'i ters çevirir.
 
 ```go
-fmt.Println(text.ReverseString("merhaba")) // abahrem
+fmt.Println(text.ReverseString("merhaba"))  // abahrem
 fmt.Println(text.ReverseString("İstanbul")) // lubnatsİ
 ```
 
 ### ToUpper / ToLower
 
 ```go
-fmt.Println(text.ToUpper("merhaba")) // MERHABA
+fmt.Println(text.ToUpper("merhaba"))  // MERHABA
 fmt.Println(text.ToLower("İSTANBUL")) // istanbul
 ```
 
@@ -83,13 +91,43 @@ fmt.Println(text.NormalizeSpace("  merhaba   dünya   ")) // "merhaba dünya"
 fmt.Println(text.NormalizeSpace("a   b\tc\nd"))        // "a b c d"
 ```
 
+### UnescapeHTML
+HTML entity'lerini gerçek karakterlere çözer.
+
+```go
+fmt.Println(text.UnescapeHTML("&Ccedil;alışma &amp; Deneme")) // Çalışma & Deneme
+```
+
+### FixTurkishMojibake
+Yanlış encoding sonucu oluşan yaygın Türkçe karakter bozulmalarını düzeltir.
+
+```go
+s := "GÃ¼nÃ¼n Ã¶zeti: ÃaÄdaÅlÄ±k"
+fmt.Println(text.FixTurkishMojibake(s)) // Günün özeti: Çağdaşlık
+```
+
+### SanitizeHTML / SanitizeHTMLWith
+Kullanıcı girdisini güvenli HTML'e çevirir (bluemonday UGCPolicy varsayılan).
+
+```go
+unsafe := "<script>alert('x')</script><b>kalın</b> <a href='http://ex.com' onclick='x()'>link</a>"
+safe := text.SanitizeHTML(unsafe) // script/onclick kaldırılır, uygun etiketler korunur
+
+// Özel policy
+p := text.HTMLPolicyUGC()
+p.AllowAttrs("class").OnElements("span", "div")
+safe2 := text.SanitizeHTMLWith(p, unsafe)
+```
+
 ## Edge-Case ve Hata Yönetimi
 - ToSlug: Sadece özel karakterlerden oluşan string için "" döner.
+- ToSlugForFile: Birden fazla noktayı tek uzantıya indirger, uzantı yoksa sadece güvenli ad döner.
 - Truncate: n<=0 ise "" döner, n>len(s) ise orijinal string döner.
 - Coalesce: Tüm argümanlar boşsa "" döner.
 - IsBlank: Sadece boşluk karakterleri varsa true, en az bir harf/rakam varsa false.
+- SanitizeHTML: script/style event handler'ları (onclick vb.) kaldırılır.
 
 ## Notlar
 - Tüm fonksiyonlar Unicode/rune-safe çalışır.
-- Türkçe karakter desteği ToSlug fonksiyonunda mevcuttur.
-- Daha fazla detay için kodu inceleyebilirsiniz.
+- Türkçe karakter desteği ToSlug ve ToSlugForFile fonksiyonlarında mevcuttur.
+- HTML sanitize işlemi için `github.com/microcosm-cc/bluemonday` kullanılır.
