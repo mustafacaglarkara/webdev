@@ -2,6 +2,8 @@
 
 Go'da dinamik, zincirlenebilir ve iç içe kullanılabilir sorgu filtreleri oluşturmak için Q objesi. SQL string ve arg dizisi üretimi, slice filtreleme ve AND/OR/NOT desteği sağlar.
 
+---
+
 ## Temel Kullanım
 
 ```go
@@ -18,6 +20,22 @@ where, args := f.ToSQL()
 // where: (name = ?) AND ((age > ?) OR (city = ?))
 // args: ["Ali", 18, "Ankara"]
 ```
+
+---
+
+## Operatörler ve Fonksiyonlar
+
+- `Eq(field, value)`   : Eşitlik (field = value)
+- `Ne(field, value)`   : Eşit değil (field != value)
+- `Gt(field, value)`   : Büyük (field > value)
+- `Gte(field, value)`  : Büyük veya eşit (field >= value)
+- `Lt(field, value)`   : Küçük (field < value)
+- `Lte(field, value)`  : Küçük veya eşit (field <= value)
+- `In(field, []any)`   : İçinde (field IN (...))
+- `Like(field, value)` : LIKE (field LIKE value)
+- `And(qs...)`         : AND zinciri
+- `Or(qs...)`          : OR zinciri
+- `Not(q)`             : NOT
 
 ---
 
@@ -50,69 +68,131 @@ where, args := f.ToSQL()
 
 ---
 
-## 3. Custom Operatör ve Alan Adı
+## 3. Dinamik Sorgu Oluşturma
+
+```go
+filters := []*q.Q{}
+if name != "" {
+    filters = append(filters, q.Eq("name", name))
+}
+if minAge > 0 {
+    filters = append(filters, q.Gte("age", minAge))
+}
+f := q.And(filters...)
+where, args := f.ToSQL()
+```
+
+---
+
+## 4. Sadece Tekli Koşul
+
+```go
+f := q.Like("username", "%ali%")
+where, args := f.ToSQL()
+// where: username LIKE ?
+// args: ["%ali%"]
+```
+
+---
+
+## 5. IN Operatörü ile Slice
+
+```go
+f := q.In("id", []any{1, 2, 3, 4})
+where, args := f.ToSQL()
+// where: id IN (?, ?, ?, ?)
+// args: [1, 2, 3, 4]
+```
+
+---
+
+## 6. NOT ile Negatif Sorgu
+
+```go
+f := q.Not(q.Lt("score", 50))
+where, args := f.ToSQL()
+// where: NOT (score < ?)
+// args: [50]
+```
+
+---
+
+## 7. Karmaşık Sorgu Zinciri
 
 ```go
 f := q.And(
-    q.Eq("LOWER(name)", "ali"),
-    q.Gt("created_at", "2024-01-01"),
+    q.Or(
+        q.Eq("type", "A"),
+        q.Eq("type", "B"),
+    ),
+    q.Gte("created_at", "2025-01-01"),
+    q.Not(q.Eq("archived", true)),
 )
 where, args := f.ToSQL()
-// where: (LOWER(name) = ?) AND (created_at > ?)
-// args: ["ali", "2024-01-01"]
+// where: ((type = ?) OR (type = ?)) AND (created_at >= ?) AND (NOT (archived = ?))
+// args: ["A", "B", "2025-01-01", true]
 ```
 
 ---
 
-## 4. Slice Filtreleme ile Q Kullanımı (opsiyonel)
+## 8. Sorgu Sonucu Slice Filtreleme (Kendi implementasyonunuz gerekebilir)
+
+Q objesi SQL string üretir, ancak slice filtreleme için custom bir fonksiyon yazabilirsiniz. Örneğin:
 
 ```go
-type User struct {
-    Name string
-    Age  int
-    City string
+// users: []User
+// filter: *q.Q
+func FilterUsers(users []User, filter *q.Q) []User {
+    // Burada filter'ı parse edip slice üzerinde filtreleme yapabilirsiniz.
+    // Bu örnek sadece SQL için uygundur.
 }
-users := []User{
-    {"Ali", 20, "Ankara"},
-    {"Ayşe", 17, "İzmir"},
-    {"Veli", 25, "Ankara"},
-}
-
-// Basit bir filter fonksiyonu:
-func Filter[T any](list []T, q *q.Q, pred func(T, string, any) bool) []T {
-    var out []T
-    for _, item := range list {
-        if matchQ(item, q, pred) {
-            out = append(out, item)
-        }
-    }
-    return out
-}
-
-// Q objesini slice üzerinde uygula (örnek pred fonksiyonu):
-filtered := Filter(users, q.And(q.Eq("City", "Ankara"), q.Gt("Age", 18)), func(u User, field string, val any) bool {
-    switch field {
-    case "City": return u.City == val
-    case "Age": return u.Age > val.(int)
-    }
-    return false
-})
-// filtered: [{Ali 20 Ankara} {Veli 25 Ankara}]
 ```
 
 ---
 
-## 5. Test ve Gelişmiş Senaryolar
+## 9. Sıkça Sorulanlar
 
-- Q objesi nil ise ToSQL boş string döner.
-- IN operatörü için []any slice kullanılır, tek değer de verilebilir.
-- NOT ile iç içe Q zincirleri oluşturulabilir.
-- SQL injection'a karşı tüm değerler parametreli olarak üretilir.
-- Slice filtrelemede pred fonksiyonu ile custom karşılaştırma yapılabilir.
+- **Q objesi ile hangi veritabanlarını kullanabilirim?**
+  - Üretilen SQL string ve args, Go'daki tüm SQL/ORM kütüphaneleriyle uyumludur (database/sql, sqlx, gorm, vs.).
+- **IN operatöründe tek değer verirsem ne olur?**
+  - Tek değerli IN için de otomatik olarak tekli placeholder üretilir.
+- **Boş Q objesi verirsem?**
+  - ToSQL fonksiyonu boş string ve nil döner.
 
 ---
 
-## Notlar
-- Q objesi ile SQL string ve arg dizisi güvenli şekilde üretilir.
-- AND/OR/NOT zincirleriyle karmaşık sorgular kolayca kurulabilir.
-- Daha fazla detay ve gelişmiş kullanım için Q.go dosyasını inceleyin.
+## 10. Gelişmiş: Dinamik Query Builder
+
+```go
+// Kullanıcıdan gelen filtreleri dinamik olarak Q objesine dönüştürme
+func BuildQFromMap(filters map[string]any) *q.Q {
+    var qs []*q.Q
+    for k, v := range filters {
+        qs = append(qs, q.Eq(k, v))
+    }
+    return q.And(qs...)
+}
+```
+
+---
+
+## 11. Test
+
+```go
+import "testing"
+
+func TestQ_ToSQL(t *testing.T) {
+    f := q.And(q.Eq("name", "Ali"), q.Gt("age", 18))
+    where, args := f.ToSQL()
+    if where != "(name = ?) AND (age > ?)" {
+        t.Errorf("unexpected where: %s", where)
+    }
+    if len(args) != 2 || args[0] != "Ali" || args[1] != 18 {
+        t.Errorf("unexpected args: %v", args)
+    }
+}
+```
+
+---
+
+Daha fazla örnek ve gelişmiş kullanım için kodu inceleyebilirsiniz.

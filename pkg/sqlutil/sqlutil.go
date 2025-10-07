@@ -187,3 +187,57 @@ func (l *SQLLoader) getOrParse(name string) (*template.Template, error) {
 	l.mu.Unlock()
 	return t, nil
 }
+
+// LoadNamed: Bir SQL dosyası içinde -- name: sorguAdi ile işaretlenmiş sorgulardan isteneni yükler ve template olarak işler.
+// Örnek dosya:
+//
+//	-- name: getProductById
+//	SELECT * FROM product WHERE id = {{.id}};
+//	-- name: listProducts
+//	SELECT * FROM product WHERE status = {{.status}};
+func (l *SQLLoader) LoadNamed(file string, queryName string, data any) (string, error) {
+	b, err := fs.ReadFile(l.fsys, file)
+	if err != nil {
+		return "", err
+	}
+	queries := parseNamedQueries(string(b))
+	q, ok := queries[queryName]
+	if !ok {
+		return "", errors.New("sorgu bulunamadı: " + queryName)
+	}
+	tmpl, err := template.New(queryName).Funcs(l.funcs).Parse(q)
+	if err != nil {
+		return "", err
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(buf.String()), nil
+}
+
+// parseNamedQueries: Dosya içindeki -- name: sorguAdi ile başlayan blokları map'e ayırır.
+func parseNamedQueries(content string) map[string]string {
+	lines := strings.Split(content, "\n")
+	queries := make(map[string]string)
+	var currentName string
+	var currentLines []string
+	flush := func() {
+		if currentName != "" && len(currentLines) > 0 {
+			queries[currentName] = strings.TrimSpace(strings.Join(currentLines, "\n"))
+		}
+		currentName = ""
+		currentLines = nil
+	}
+	for _, line := range lines {
+		trim := strings.TrimSpace(line)
+		if strings.HasPrefix(trim, "-- name:") {
+			flush()
+			currentName = strings.TrimSpace(strings.TrimPrefix(trim, "-- name:"))
+		} else if currentName != "" {
+			currentLines = append(currentLines, line)
+		}
+	}
+	flush()
+	return queries
+}

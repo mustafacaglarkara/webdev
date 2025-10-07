@@ -61,7 +61,7 @@ var (
 	stmtMetrics = struct{ prepares, hits int64 }{}
 )
 
-// Init: config ile global DB’yi hazırlar. Tek sefer çağrılmalıdır.
+// Init: Verilen yapılandırma ile global veritabanı bağlantısını başlatır. Tek sefer çağrılmalıdır.
 func Init(cfg Config) error {
 	db, err := openDB(cfg)
 	if err != nil {
@@ -83,14 +83,14 @@ func Init(cfg Config) error {
 	return nil
 }
 
-// DB: global *gorm.DB döner (Init sonrası).
+// DB: Global *gorm.DB nesnesini döner. Init sonrası kullanılabilir.
 func DB() *gorm.DB {
 	mu.RLock()
 	defer mu.RUnlock()
 	return defaultDB
 }
 
-// Close: global bağlantıyı kapatır.
+// Close: Global veritabanı bağlantısını ve statement cache'i kapatır.
 func Close() error {
 	mu.Lock()
 	defer mu.Unlock()
@@ -111,8 +111,7 @@ func Close() error {
 	return err
 }
 
-// PrepareCached: psuedo-prepare (gorm zaten driver prepare kullanır). Bu fonksiyon sadece sorgu metnini cache'ler ve kullanım sayaçları tutar.
-// Eğer gerçek *sql.Stmt gereksinimi oluşursa database/sql seviyesinde yönetmek gerekir.
+// prepareAndCache: SQL sorgusunu cache'ler ve gerekirse hazırlar. Statement cache aktifse kullanılır.
 // prepareAndCache prepares a *sql.Stmt for the concrete bound SQL (with ? placeholders)
 // and stores it into stmtCache. Returns the prepared stmt (or nil if caching disabled).
 func prepareAndCache(bound string) (*sql.Stmt, error) {
@@ -168,7 +167,7 @@ func prepareAndCache(bound string) (*sql.Stmt, error) {
 	return s, nil
 }
 
-// StmtMetrics: prepare/hit sayaçlarını döner.
+// StmtMetrics: Statement cache için prepare ve hit sayaçlarını döner.
 func StmtMetrics() (prepares, hits int64) {
 	stmtMu.RLock()
 	prepares = stmtMetrics.prepares
@@ -177,7 +176,7 @@ func StmtMetrics() (prepares, hits int64) {
 	return
 }
 
-// ExecPrepared: PrepareCached üzerinden geçen sorguyu çalıştırır.
+// ExecPrepared: Hazırlanmış (prepared) statement ile sorgu çalıştırır. Statement cache aktifse kullanılır.
 // ExecPrepared: tries to prepare the concrete SQL and execute via *sql.Stmt when enabled.
 func ExecPrepared(ctx context.Context, sqlText string, params map[string]any) (int64, error) {
 	db := DB()
@@ -211,7 +210,7 @@ func ExecPrepared(ctx context.Context, sqlText string, params map[string]any) (i
 	return rows, err
 }
 
-// QueryPrepared: currently delegates to QueryString (prepared scanning not implemented)
+// QueryPrepared: Hazırlanmış statement ile sorgu sonucu slice olarak döner. Şu an QueryString'e yönlendirir.
 func QueryPrepared[T any](ctx context.Context, sqlText string, params map[string]any, dest *[]T) error {
 	return QueryString[T](ctx, sqlText, params, dest)
 }
@@ -292,7 +291,7 @@ func ensureQueryID(ctx context.Context) context.Context {
 
 // ----- public helpers (global DB ile) -----
 
-// MigrateDir: `dir` altındaki *.sql dosyalarını ada göre sırayla tek transaction’da çalıştırır.
+// MigrateDir: Bir dizindeki tüm .sql dosyalarını sıralı ve tek transaction ile çalıştırır.
 func MigrateDir(ctx context.Context, fsys fs.FS, dir string) error {
 	db := DB()
 	if db == nil {
@@ -338,7 +337,7 @@ func MigrateDir(ctx context.Context, fsys fs.FS, dir string) error {
 	})
 }
 
-// ExecSQL: `${ad}` parametrelerini bağlayıp DML/DDL çalıştırır. RowsAffected döner.
+// ExecSQL: Bir .sql dosyasını okuyup parametrelerle çalıştırır. RowsAffected döner.
 func ExecSQL(ctx context.Context, fsys fs.FS, file string, params map[string]any) (int64, error) {
 	db := DB()
 	if db == nil {
@@ -351,16 +350,22 @@ func ExecSQL(ctx context.Context, fsys fs.FS, file string, params map[string]any
 	return ExecString(ctx, raw, params)
 }
 
-// InsertSQL/UpdateSQL/DeleteSQL/SelectSQL: dosya tabanlı semantik kısayollar
+// InsertSQL: Dosya tabanlı INSERT işlemi için kısa yol.
 func InsertSQL(ctx context.Context, fsys fs.FS, file string, params map[string]any) (int64, error) {
 	return ExecSQL(ctx, fsys, file, params)
 }
+
+// UpdateSQL: Dosya tabanlı UPDATE işlemi için kısa yol.
 func UpdateSQL(ctx context.Context, fsys fs.FS, file string, params map[string]any) (int64, error) {
 	return ExecSQL(ctx, fsys, file, params)
 }
+
+// DeleteSQL: Dosya tabanlı DELETE işlemi için kısa yol.
 func DeleteSQL(ctx context.Context, fsys fs.FS, file string, params map[string]any) (int64, error) {
 	return ExecSQL(ctx, fsys, file, params)
 }
+
+// SelectSQL: SELECT sonuçlarını `dest`’e yazar.
 func SelectSQL[T any](ctx context.Context, fsys fs.FS, file string, params map[string]any, dest *[]T) error {
 	return QuerySQL[T](ctx, fsys, file, params, dest)
 }

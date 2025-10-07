@@ -7,7 +7,6 @@ SQL işlemleri için yardımcı fonksiyonlar içerir. Sorgu oluşturma, SQL temp
 ### SQLLoader ile Dosyadan SQL Yükleme
 
 ```go
-package main
 import (
     "embed"
     "fmt"
@@ -36,6 +35,52 @@ SELECT * FROM users WHERE id = {{.id}};
 ```
 SELECT * FROM users WHERE id = 42;
 ```
+
+---
+
+## Çoklu Sorgu: LoadNamed ile Tek Dosyada Birden Fazla Sorgu
+
+Bir dosyada birden fazla sorgu tutmak için her sorgunun başına `-- name: sorguAdi` ekleyin:
+
+`queries/product.sql`:
+```sql
+-- name: getProductById
+SELECT * FROM product WHERE id = {{.id}};
+
+-- name: listProducts
+SELECT * FROM product WHERE status = {{.status}};
+```
+
+Kullanım:
+```go
+sql, err := loader.LoadNamed("queries/product.sql", "getProductById", map[string]any{"id": 5})
+// sql: SELECT * FROM product WHERE id = 5;
+
+sql, err := loader.LoadNamed("queries/product.sql", "listProducts", map[string]any{"status": "active"})
+// sql: SELECT * FROM product WHERE status = 'active';
+```
+
+---
+
+## GORM ile Kullanım
+
+sqlutil ile üretilen SQL sorgularını GORM ile kullanabilirsiniz:
+
+```go
+import (
+    "gorm.io/gorm"
+    "your/module/path/pkg/sqlutil"
+)
+
+var result []Product
+sql, err := loader.LoadNamed("queries/product.sql", "getProductById", map[string]any{"id": 1})
+if err != nil {
+    panic(err)
+}
+err = db.Raw(sql).Scan(&result).Error
+```
+
+Aynı şekilde, parametreli sorgularda da GORM'un Raw/Exec fonksiyonlarını kullanabilirsiniz.
 
 ---
 
@@ -68,12 +113,6 @@ UPDATE users {{ setList .fields }} WHERE id = ?;
 -- Sonuç: SET email=?, name=?
 ```
 
-### spOutDecl, spOutVal (SQL Server stored procedure için)
-```sql
-EXEC sp_test {{ spOutDecl "result" "int" }} OUTPUT;
--- Sonuç: @result int OUTPUT
-```
-
 ---
 
 ## PreloadDir ile Tüm SQL'leri Önden Parse Etme
@@ -95,29 +134,11 @@ raw, err := loader.LoadRaw("queries/raw.sql")
 
 ---
 
-## Edge-Case ve Hata Yönetimi
+## Hata Yönetimi
 
-### Hatalı Template veya Eksik Parametre
-
-```go
-_, err := loader.Load("queries/user_by_id.sql", nil)
-// error: template: ...: "id" is not defined
-```
-
-### Geçersiz Dosya Yolu
-
-```go
-_, err := loader.Load("../secret.sql", nil)
-// error: invalid template path
-```
-
-### Boş veya Hatalı inList
-
-```sql
-SELECT * FROM users WHERE {{ inList "id" .ids }};
--- .ids = []
--- Sonuç: 1=0
-```
+- Sorgu adı bulunamazsa: `sorgu bulunamadı: ...` hatası döner.
+- Eksik parametre veya hatalı template: Go template hatası döner.
+- Geçersiz dosya yolu: `invalid template path` hatası döner.
 
 ---
 
@@ -126,5 +147,5 @@ SELECT * FROM users WHERE {{ inList "id" .ids }};
 - Parametreler map veya struct olarak verilebilir.
 - PreloadDir ile tüm SQL'ler baştan parse edilip cache'lenir.
 - inList, setList gibi fonksiyonlar edge-case'lerde güvenli sonuç döner.
-- Hatalar error olarak döner, mutlaka kontrol edilmelidir.
+- sqlutil ile üretilen SQL'ler GORM ile doğrudan kullanılabilir.
 - Daha fazla detay için kodu ve testleri inceleyin.
