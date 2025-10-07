@@ -2,6 +2,16 @@
 
 Bu proje, Go ile geliştirilmiş çok amaçlı yardımcı paketler koleksiyonudur. Her bir paket, belirli bir ihtiyaca yönelik pratik fonksiyonlar sunar. Tüm paketler `pkg` dizini altında toplanmıştır.
 
+## Yeni Eklenenler
+Kısa özet — son eklemeler ve geliştirmeler:
+- `pkg/ratelimit`: Token-bucket tabanlı rate limiter. E-posta veya harici API çağrılarını sınırlamak için kullanışlı yardımcılar içerir (Allow, Wait, Do).
+- `pkg/sqlutil`: Stored procedure OUT parametreleri için template yardımcıları (`spOutDecls`, `spOutVals`) eklendi; tek dosyada birden fazla sorgu tutma (`LoadNamed`) ve dinamik template fonksiyonları mevcut.
+- `pkg/grpcx`: gRPC yardımcıları genişletildi — unary/stream interceptor desteği, kolay `Dial`/`DialStream`, metadata ve header/trailer gönderme yardımcıları.
+- `pkg/text`: `UnescapeHTML`, `FixTurkishMojibake`, `ToSlugForFile` ve `SanitizeHTML` gibi metin ve HTML güvenliği yardımcıları eklendi.
+- `pkg/fs`: Upload doğrulama için `IsAllowedExtension`, `DetectMIMEFromFile` ve `IsAllowedMIMEFromFile` fonksiyonları eklendi.
+
+Detaylı kullanım örnekleri ve dokümantasyon her paketin kendi `README.md` dosyasında yer almaktadır (ör. `pkg/sqlutil/README.md`, `pkg/ratelimit/README.md`, `pkg/text/README.md`, `pkg/fs/README.md`, `pkg/grpcx/README.md`).
+
 ## Kurulum
 
 ```bash

@@ -1,0 +1,28 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Builds
+bin/
+dist/
+
+# Logs
+log/
+
+# OS/Editor
+.DS_Store
+.idea/
+.vscode/
+
+# Coverage/Tests
+coverage.*
+*.out
+
+# Vendor (if used)
+vendor/
+yapilacaklar/
+yapilackalar/
+001_depo/
