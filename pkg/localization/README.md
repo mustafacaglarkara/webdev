@@ -65,6 +65,32 @@ msg, err := loc.Localize(&i18n.LocalizeConfig{MessageID: "bye"})
 
 ---
 
+## HTTP / Fiber ile Kullanım (Önerilen)
+
+```go
+import (
+    "github.com/gofiber/fiber/v2"
+    "github.com/mustafacaglarkara/webdev/pkg/web"
+    "github.com/mustafacaglarkara/webdev/pkg/localization"
+)
+
+// Dil belirleme (Accept-Language + fallback)
+func Handler(c *fiber.Ctx) error {
+    langs := web.FiberLangs(c, "tr")
+    msg := localization.TDefault(langs, "home.title", nil)
+    return c.SendString(msg)
+}
+
+// Dil değiştirme (session'a kaydet)
+func SwitchLang(c *fiber.Ctx) error {
+    code := c.Params("code") // "tr" veya "en"
+    _ = web.FiberSetPreferredLang(c, code)
+    return c.Redirect("/", fiber.StatusFound)
+}
+```
+
+---
+
 ## JSON Dil Dosyası Örneği (locales/active.tr.json)
 
 ```json

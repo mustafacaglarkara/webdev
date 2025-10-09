@@ -94,3 +94,17 @@ func convertArg(a any, t reflect.Type) any {
 	}
 	return a
 }
+
+// CallTag registered tag'leri isimleriyle çağırmak için kullanılan yardımcı fonksiyondur.
+// Diğer paketler tarafından kullanılmak üzere dışa aktarılmıştır.
+func CallTag(name string, args ...any) any {
+	// güvenli arama
+
+	tagMu.RLock()
+	fn, ok := tagRegistry[name]
+	tagMu.RUnlock()
+	if !ok {
+		return ""
+	}
+	return callTag(name, fn, args...)
+}

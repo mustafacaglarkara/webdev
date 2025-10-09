@@ -1,4 +1,4 @@
-package text
+package strutil
 
 import (
 	"html"
@@ -6,9 +6,24 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
-
-	"github.com/microcosm-cc/bluemonday"
 )
+
+// SplitAndTrim splits a comma-separated string, trims spaces and returns non-empty parts.
+// Returns nil for empty input (to preserve previous behavior).
+func SplitAndTrim(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 // ToSlug dönüştürme: Türkçe karakterleri sadeleştirip a-z0-9 ve '-' biçimine çevirir.
 func ToSlug(s string) string {
@@ -76,7 +91,6 @@ func NormalizeSpace(s string) string {
 func UnescapeHTML(s string) string { return html.UnescapeString(s) }
 
 // FixTurkishMojibake: Yaygın Türkçe mojibake karakterlerini düzeltir.
-// Kaynak: bazı eski sayfalarda/JSON çıktılarında görülen yanlış encoding dizgeleri.
 func FixTurkishMojibake(s string) string {
 	repls := map[string]string{
 		"ã¶": "ö", "Ã¶": "ö", "Ä±": "ı", "Ä°": "İ", "Ã¼": "ü",
@@ -90,9 +104,6 @@ func FixTurkishMojibake(s string) string {
 }
 
 // ToSlugForFile: Dosya adları için güvenli slug üretir.
-// - Türkçe karakterleri sadeleştirir, küçük harf yapar
-// - Son uzantıyı korur; isim kısmını a-z0-9 ve '-' ile sınırlar
-// - Birden fazla noktayı tek uzantıya indirger
 func ToSlugForFile(name string) string {
 	if name == "" {
 		return ""
@@ -108,30 +119,8 @@ func ToSlugForFile(name string) string {
 	re := regexp.MustCompile(`[^a-z0-9]+`)
 	base = re.ReplaceAllString(base, "-")
 	base = strings.Trim(base, "-")
-	// Uzantıdaki noktayı koru, geri kalanını sade bırak
 	if ext != "" {
-		// Sadece harf/rakam ve nokta, artı/minus değil -> ext zaten .xxx formatında
 		return base + ext
 	}
 	return base
 }
-
-// SanitizeHTML: Varsayılan UGCPolicy ile güvenli HTML döndürür.
-func SanitizeHTML(s string) string {
-	p := bluemonday.UGCPolicy()
-	return p.Sanitize(s)
-}
-
-// SanitizeHTMLWith: Verilen policy ile HTML sanitize eder; policy nil ise UGCPolicy kullanır.
-func SanitizeHTMLWith(policy *bluemonday.Policy, s string) string {
-	if policy == nil {
-		policy = bluemonday.UGCPolicy()
-	}
-	return policy.Sanitize(s)
-}
-
-// HTMLPolicyUGC: Kullanıcı içeriği için uygun varsayılan policy döndürür.
-func HTMLPolicyUGC() *bluemonday.Policy { return bluemonday.UGCPolicy() }
-
-// HTMLPolicyStrict: En sıkı (yalnızca text) policy döndürür.
-func HTMLPolicyStrict() *bluemonday.Policy { return bluemonday.StrictPolicy() }

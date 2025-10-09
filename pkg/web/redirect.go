@@ -3,33 +3,22 @@ package web
 import (
 	"fmt"
 	"net/http"
-	"sync"
+
+	"github.com/mustafacaglarkara/webdev/pkg/router"
 )
 
-var (
-	routeMu  sync.RWMutex
-	routeMap = map[string]string{}
-)
-
-// RegisterRoute registers a name -> path mapping. Use at app startup.
+// RegisterRoute registers a name -> path mapping by delegating to pkg/router.
 func RegisterRoute(name, path string) {
-	routeMu.Lock()
-	defer routeMu.Unlock()
-	routeMap[name] = path
+	router.RegisterRoute(name, path)
 }
 
-// Route returns the path for a named route. Optional args will be fmt.Sprintf applied to the path.
+// Route returns the path for a named route. Optional args will be forwarded to router.ReverseURL.
 func Route(name string, args ...interface{}) (string, bool) {
-	routeMu.RLock()
-	p, ok := routeMap[name]
-	routeMu.RUnlock()
-	if !ok {
+	s, err := router.ReverseURL(name, args...)
+	if err != nil {
 		return "", false
 	}
-	if len(args) == 0 {
-		return p, true
-	}
-	return fmt.Sprintf(p, args...), true
+	return s, true
 }
 
 // RedirectTo redirects to a URL with the provided status code.
