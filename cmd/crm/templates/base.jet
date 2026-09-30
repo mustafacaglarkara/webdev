@@ -1,0 +1,68 @@
+{* Ortak yerleşim. Sayfa şablonları fiberweb.Render(c, view, data, "base") ile buraya
+       gömülür ({{ embed() }}). Tüm {{ ... }} çıktıları Jet tarafından HTML kaçışlanır. *}
+<!doctype html>
+<html lang="{{ Lang }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ if Title != "" }}{{ Title }} · {{ end }}{{ t(ctx, "app.name") }}</title>
+  <link rel="stylesheet" href="{{ static("css/style.css") }}">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="{{ route("home") }}">{{ t(ctx, "app.name") }}</a>
+  <nav class="menu" aria-label="{{ t(ctx, "nav.main") }}">
+    <ul>
+    {{- range _, item := Menu }}
+      <li class="{{ if item.Active }}active{{ end }}">
+        {{- if item.URL != "" }}
+        <a href="{{ item.URL }}"{{ if item.Active }} aria-current="page"{{ end }}>{{ t(ctx, item.LabelKey) }}</a>
+        {{- else }}
+        <span class="group">{{ t(ctx, item.LabelKey) }}</span>
+        {{- end }}
+        {{- if item.Badge != "" }} <span class="{{ item.BadgeClass }}">{{ item.Badge }}</span>{{ end }}
+        {{- if len(item.Children) > 0 }}
+        <ul class="submenu">
+          {{- range _, child := item.Children }}
+          <li class="{{ if child.Active }}active{{ end }}"><a href="{{ child.URL }}"{{ if child.Active }} aria-current="page"{{ end }}>{{ t(ctx, child.LabelKey) }}</a></li>
+          {{- end }}
+        </ul>
+        {{- end }}
+      </li>
+    {{- end }}
+    </ul>
+  </nav>
+  <div class="tools">
+    <form method="post" action="{{ route("lang.switch") }}" class="inline">
+      <input type="hidden" name="csrf_token" value="{{ CSRFToken }}">
+      <input type="hidden" name="next" value="{{ Path }}">
+      <button type="submit" name="lang" value="tr" class="link{{ if Lang == "tr" }} current{{ end }}">TR</button>
+      <button type="submit" name="lang" value="en" class="link{{ if Lang == "en" }} current{{ end }}">EN</button>
+    </form>
+    {{- if IsAuthenticated }}
+    <span class="who">{{ UserName }} <small>({{ UserRole }})</small></span>
+    <form method="post" action="{{ route("auth.logout") }}" class="inline">
+      <input type="hidden" name="csrf_token" value="{{ CSRFToken }}">
+      <button type="submit" class="link">{{ t(ctx, "nav.logout") }}</button>
+    </form>
+    {{- else }}
+    <a href="{{ route("auth.login") }}">{{ t(ctx, "nav.login") }}</a>
+    {{- end }}
+  </div>
+</header>
+
+<main class="container">
+  {{- if FlashSuccess != "" }}
+  <div class="flash flash-success" role="status">{{ FlashSuccess }}</div>
+  {{- end }}
+  {{- if FlashError != "" }}
+  <div class="flash flash-error" role="alert">{{ FlashError }}</div>
+  {{- end }}
+  {{ embed() }}
+</main>
+
+<footer class="footer">
+  {{ t(ctx, "footer.text", dict("Year", Year)) }}
+</footer>
+</body>
+</html>

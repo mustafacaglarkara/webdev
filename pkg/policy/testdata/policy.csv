@@ -1,0 +1,3 @@
+p, admin, /admin/*, GET
+p, admin, /admin, GET
+p, guest, /public, GET

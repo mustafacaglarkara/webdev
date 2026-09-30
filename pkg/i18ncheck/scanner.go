@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +17,9 @@ type UsageMap map[string][]string // key -> files
 type CollectResult struct {
 	Keys  map[string]struct{}
 	Usage UsageMap
+	// ReadErrors okunamayan şablon dosyaları için "yol: hata" iletileri
+	// (sıralı). Boş değilse rapor çıkış kodu 1 olur.
+	ReadErrors []string
 }
 
 func hasExt(path string, exts []string) bool {
@@ -31,10 +35,21 @@ func hasExt(path string, exts []string) bool {
 	return false
 }
 
+// CollectTemplateKeys TemplatesRoot altındaki şablonlarda Pattern'in 1.
+// yakalama grubunu anahtar olarak toplar. cfg.Workers <= 0 ise
+// runtime.NumCPU() işçi kullanılır. Okunamayan dosyalar tarama durdurulmadan
+// ReadErrors'a eklenir.
 func CollectTemplateKeys(cfg *Config) (*CollectResult, error) {
 	re, err := regexp.Compile(cfg.Pattern)
 	if err != nil {
 		return nil, fmt.Errorf("regex derlenemedi: %w", err)
+	}
+	if re.NumSubexp() < 1 {
+		return nil, fmt.Errorf("regex en az bir yakalama grubu içermeli: %s", cfg.Pattern)
+	}
+	workers := cfg.Workers
+	if workers <= 0 {
+		workers = runtime.NumCPU()
 	}
 	// load gitignore matcher if provided
 	var gi *GitignoreMatcher
@@ -51,6 +66,9 @@ func CollectTemplateKeys(cfg *Config) (*CollectResult, error) {
 	excluder := NewPathExcluder(cfg.ExcludePatterns, gi)
 	// list files
 	var files []string
+	if _, statErr := os.Stat(cfg.TemplatesRoot); statErr != nil {
+		return nil, fmt.Errorf("şablon dizini okunamadı (%s): %w", cfg.TemplatesRoot, statErr)
+	}
 	err = filepath.WalkDir(cfg.TemplatesRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -80,14 +98,16 @@ func CollectTemplateKeys(cfg *Config) (*CollectResult, error) {
 	}
 	res := &CollectResult{Keys: map[string]struct{}{}, Usage: UsageMap{}}
 	var mu sync.Mutex
-	ch := make(chan string)
+	ch := make(chan string, len(files))
 	var wg sync.WaitGroup
 	worker := func() {
 		defer wg.Done()
 		for f := range ch {
 			b, err := os.ReadFile(f)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "okuma hatası %s: %v\n", f, err)
+				mu.Lock()
+				res.ReadErrors = append(res.ReadErrors, fmt.Sprintf("%s: %v", f, err))
+				mu.Unlock()
 				continue
 			}
 			matches := re.FindAllStringSubmatch(string(b), -1)
@@ -118,7 +138,7 @@ func CollectTemplateKeys(cfg *Config) (*CollectResult, error) {
 			mu.Unlock()
 		}
 	}
-	for i := 0; i < cfg.Workers; i++ {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go worker()
 	}
@@ -127,6 +147,7 @@ func CollectTemplateKeys(cfg *Config) (*CollectResult, error) {
 	}
 	close(ch)
 	wg.Wait()
+	sort.Strings(res.ReadErrors)
 	// normalize usage ordering per key for deterministic output
 	for k, v := range res.Usage {
 		sort.Strings(v)

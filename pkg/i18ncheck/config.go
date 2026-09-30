@@ -10,6 +10,17 @@ import (
 	"github.com/mustafacaglarkara/webdev/pkg/strutil"
 )
 
+// DefaultPattern varsayılan anahtar desenidir. Şu çağrıları yakalar
+// (anahtar çift tırnaklı bir metin olmalıdır, 1. yakalama grubu):
+//
+//	t("home.title")
+//	t(ctx, "home.title")
+//	t( ctx , "home.title", data)
+const DefaultPattern = `\bt\(\s*(?:ctx\s*,\s*)?"([^"]+)"`
+
+// Config i18ncheck çalıştırma ayarlarıdır. Doğrudan oluşturulabilir veya
+// ParseFlags ile komut satırından doldurulabilir; Workers <= 0 ise CPU sayısı
+// kadar işçi kullanılır.
 type Config struct {
 	TemplatesRoot      string
 	LocaleGlob         string
@@ -35,7 +46,7 @@ func ParseFlags(args []string) (*Config, error) {
 	var (
 		templates  = fs.String("templates", "cmd/crm/templates", "Şablon (template) kök dizini")
 		locales    = fs.String("locales", "cmd/crm/locales/*.json", "Locale JSON glob pattern")
-		pattern    = fs.String("pattern", `\bt\((?:ctx\s*,\s*)?"([^"]+)"`, "Çeviri anahtarı regex capture grubu 1'de olmalı")
+		pattern    = fs.String("pattern", DefaultPattern, "Çeviri anahtarı regex capture grubu 1'de olmalı")
 		exts       = fs.String("ext", ".jet", "Virgülle ayrılmış taranacak uzantılar (örn: .jet,.html)")
 		ignore     = fs.String("ignore", "", "Virgülle ayrılmış yok sayılacak anahtar ön ekleri")
 		exclude    = fs.String("exclude", "", "Virgülle ayrılmış dizin veya dosya glob desenleri (templates root'a göre)")

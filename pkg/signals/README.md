@@ -1,113 +1,60 @@
 # signals
 
-Observer pattern ve event sinyalleri için yardımcı katman. Django Signals benzeri, Go'da generic ve thread-safe event sistemi sağlar. Hem tekil Signal hem de çoklu topic için Bus ile kullanılabilir.
-
----
-
-## 1. Temel Kullanım: Signal (Generic Event)
+Generic, eşzamanlı kullanıma güvenli yayınla/abone ol (observer) mekanizması.
 
 ```go
-import (
-    "fmt"
-    "your/module/path/pkg/signals"
-)
+import "github.com/mustafacaglarkara/webdev/pkg/signals"
+```
 
-sig := signals.New[string]()
-unsubscribe := sig.Subscribe(func(s string) {
-    fmt.Println("event:", s)
+## Signal
+
+```go
+type UserCreated struct{ ID int }
+
+sig := signals.New[UserCreated]()
+
+unsubscribe := sig.Subscribe(func(e UserCreated) {
+    fmt.Println("kullanıcı:", e.ID)
+})
+defer unsubscribe()
+
+sig.OnPanic(func(r any, stack []byte) {
+    slog.Error("abone paniği", "panic", r)
 })
 
-sig.Emit("pre_save") // "event: pre_save"
-
-// Abonelikten çıkmak için:
-unsubscribe()
-sig.Emit("post_save") // callback çalışmaz
+sig.Emit(UserCreated{ID: 7})
+fmt.Println(sig.Len()) // aktif abone sayısı
+sig.Clear()            // tüm aboneleri kaldır
 ```
 
----
-
-## 2. Bus ile Çoklu Topic/Event
+## Bus (konu tabanlı)
 
 ```go
-bus := signals.NewBus()
-bus.Topic("user.created").Subscribe(func(v any) {
-    fmt.Println("Kullanıcı oluşturuldu:", v)
+bus := signals.NewBus() // veya signals.Default
+
+un := bus.Subscribe("order.paid", func(v any) {
+    fmt.Println("ödendi:", v)
 })
-bus.Topic("user.deleted").Subscribe(func(v any) {
-    fmt.Println("Kullanıcı silindi:", v)
-})
+bus.Emit("order.paid", 42)
+un()
 
-bus.Topic("user.created").Emit(map[string]any{"id": 1, "name": "Ali"})
-bus.Topic("user.deleted").Emit(1)
+bus.Topic("order.paid").Emit(43) // Signal[any]'e doğrudan erişim
+bus.RemoveTopic("order.paid")
 ```
 
----
+`Bus.Emit` var olmayan bir konu için hiçbir şey yapmaz (konu oluşturmaz).
 
-## 3. Varsayılan Bus ile Global Event
+## Davranış
 
-```go
-signals.Default.Topic("order.paid").Subscribe(func(v any) {
-    fmt.Println("Sipariş ödendi:", v)
-})
-signals.Default.Topic("order.paid").Emit(42)
-```
-
----
-
-## 4. Domain Event Senaryosu: Modelden Modele Bildirim
-
-Bir modelde ürün eklendiğinde başka bir modelin haberdar olması için domain event (ör: "product.created") yayınlanır ve diğer model bu event'e abone olur.
-
-### Ürün Modeli (Product)
-
-```go
-type Product struct {
-    ID   int
-    Name string
-}
-
-func (p *Product) Save() {
-    // ...veritabanına ekleme işlemi...
-    signals.Default.Topic("product.created").Emit(p)
-}
-```
-
-### Stok Modeli (Stock) - Event'e Abone Olma
-
-```go
-func init() {
-    signals.Default.Topic("product.created").Subscribe(func(v any) {
-        p, ok := v.(*Product)
-        if !ok { return }
-        // Yeni ürün eklendiğinde stok kaydı oluştur
-        fmt.Printf("Stok açıldı: %d %s\n", p.ID, p.Name)
-        // Stock.CreateForProduct(p.ID)
-    })
-}
-```
-
-### Kullanım
-
-```go
-func main() {
-    // Stock init fonksiyonu ile abone olur
-    p := &Product{ID: 1, Name: "Kalem"}
-    p.Save() // "Stok açıldı: 1 Kalem" çıktısı alınır
-}
-```
-
----
-
-## 5. Edge-Case ve Gelişmiş Senaryolar
-
-- Birden fazla model aynı event'e abone olabilir (ör: hem Stock hem Notification).
-- Event verisi struct pointer, map veya id olabilir; abone fonksiyonu tip kontrolü yapmalı.
-- Abonelikten çıkmak için unsubscribe fonksiyonu saklanabilir.
-- Event-driven mimaride, model event'leriyle loosely-coupled modüller oluşturulabilir.
-
----
+- Aboneler **kayıt sırasıyla**, `Emit`'i çağıran goroutine'de senkron çağrılır.
+- Bir abonenin paniği yakalanır ve `OnPanic` ile (tanımlı değilse `slog.Default()`
+  üzerinden `Error` seviyesinde, stack ile) raporlanır; sonraki aboneler yine çağrılır.
+- `Subscribe` dönen iptal fonksiyonu birden fazla kez çağrılabilir; `Emit`
+  sırasında (abone içinden bile) çağrılması güvenlidir. Devam eden `Emit`,
+  başladığı andaki abone listesini kullanır.
+- `Subscribe(nil)` hiçbir şey eklemez ve etkisiz bir iptal fonksiyonu döner.
 
 ## Notlar
-- Signal ve Bus thread-safe'dir, paralel kullanımda güvenlidir.
-- Tüm event verileri generic (Signal[T]) veya any (Bus) ile taşınabilir.
-- Daha fazla detay ve gelişmiş kullanım için kodu ve testleri inceleyin.
+
+- Uzun süren işleri abone içinde yapmayın; `Emit` tüm aboneler bitene kadar bloklar.
+  Gerekirse abone içinde kendi goroutine'inizi başlatın.

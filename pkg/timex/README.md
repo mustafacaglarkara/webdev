@@ -1,77 +1,70 @@
 # timex
 
-Zaman ve tarih işlemleri için yardımcı fonksiyonlar içerir. Şu anki zamanı alma, tarih biçimlendirme, iki tarih arasındaki farkı bulma, timestamp üretme, gün başlangıcı/sonu, zaman parse etme ve context ile uyumlu sleep gibi işlemler için kullanılır.
-
-## Fonksiyonlar ve Detaylı Kullanım Örnekleri
-
-### Now
-Şu anki zamanı döner (time.Now wrapper).
 ```go
-now := timex.Now()
-fmt.Println(now) // 2025-09-25 14:30:00 +0300 +03 m=+0.000000001
+import "github.com/mustafacaglarkara/webdev/pkg/timex"
 ```
 
-### FormatDate
-Bir zamanı verilen layout ile string'e çevirir.
+Zaman ve tarih yardımcıları: biçimlendirme, gün başı/sonu, saat dilimli
+ayrıştırma (Europe/Istanbul dahil) ve iptal edilebilir bekleme. Örnek
+çıktıları `example_test.go` ile doğrulanır.
+
+## Ayrıştırma ve saat dilimi
+
+`ParseTime` / `MustParseTime` `time.Parse` kullanır: layout ve değer saat
+dilimi bilgisi içermiyorsa sonuç **UTC**'dir. Kullanıcıdan gelen yerel saatler
+için `ParseTimeIn` veya `ParseTimeIstanbul` kullanın.
+
 ```go
-t := timex.Now()
-fmt.Println(timex.FormatDate(t, "2006-01-02 15:04:05")) // 2025-09-25 14:30:00
+t, _ := timex.ParseTime("2006-01-02 15:04", "2025-09-25 14:30")
+fmt.Println(t) // 2025-09-25 14:30:00 +0000 UTC
+
+ist, _ := timex.ParseTimeIstanbul("02.01.2006 15:04", "25.09.2025 14:30")
+fmt.Println(ist)       // 2025-09-25 14:30:00 +0300 +03
+fmt.Println(ist.UTC()) // 2025-09-25 11:30:00 +0000 UTC
+
+loc, _ := time.LoadLocation("Europe/Berlin")
+b, _ := timex.ParseTimeIn("2006-01-02 15:04", "2025-09-25 14:30", loc)
+fmt.Println(b) // 2025-09-25 14:30:00 +0200 CEST
 ```
 
-### DateDiff
-İki zaman arasındaki farkı (duration) döner.
+- `ParseTimeIn(layout, value, loc)`: `time.ParseInLocation`; `loc == nil` ise UTC.
+- `Istanbul()`: `Europe/Istanbul` konumu (bir kez yüklenir). Sistemde tz
+  veritabanı yoksa sabit `+03` konumuna düşer; 2016 öncesi tarihler için
+  programınıza `import _ "time/tzdata"` ekleyin.
+- `MustParseTime` hata durumunda panik atar; yalnızca sabit/test verisi için.
+
+## Gün başı / sonu
+
+`StartOfDay` ve `EndOfDay` `t`'nin kendi konumunda çalışır. Gece yarısının yaz
+saati geçişi nedeniyle var olmadığı bölgelerde (ör. `America/Santiago`)
+günün var olan ilk anını döner; `EndOfDay` ertesi günün başından 1ns öncesidir.
+
 ```go
-a := timex.Now()
-b := a.Add(-48 * time.Hour)
-fmt.Println(timex.DateDiff(a, b)) // 48h0m0s
+t := time.Date(2025, 9, 25, 14, 30, 0, 0, timex.Istanbul())
+fmt.Println(timex.StartOfDay(t))                    // 2025-09-25 00:00:00 +0300 +03
+fmt.Println(timex.EndOfDay(t))                      // 2025-09-25 23:59:59.999999999 +0300 +03
+fmt.Println(timex.FormatDate(t, "02.01.2006 15:04")) // 25.09.2025 14:30
+fmt.Println(timex.DateDiff(t, t.Add(-48*time.Hour))) // 48h0m0s
 ```
 
-### Timestamp
-Şu anki zamanı Unix timestamp (saniye) olarak döner.
-```go
-fmt.Println(timex.Timestamp()) // 1758772200
-```
+Diğerleri: `Now()` (`time.Now`), `Timestamp()` (Unix saniye).
 
-### StartOfDay / EndOfDay
-Bir zamanın gün başlangıcı ve gün sonunu döner.
-```go
-t := timex.Now()
-fmt.Println(timex.StartOfDay(t)) // 2025-09-25 00:00:00 +0300 +03
-fmt.Println(timex.EndOfDay(t))   // 2025-09-25 23:59:59 +0300 +03
-```
+## İptal edilebilir bekleme
 
-### ParseTime / MustParseTime
-Bir string'i verilen layout ile time.Time'a çevirir.
 ```go
-t, err := timex.ParseTime("2006-01-02", "2025-09-25")
-if err != nil {
-    panic(err)
-}
-fmt.Println(t) // 2025-09-25 00:00:00 +0300 +03
-
-// Hatalı girişte panic atan versiyon:
-t2 := timex.MustParseTime("2006-01-02", "2025-09-25")
-fmt.Println(t2)
-```
-
-### SleepCtx
-Belirtilen süre kadar bekler veya context iptal edilirse hemen döner. Zamanlayıcı tetiklenirse true, context kapanırsa false döner.
-```go
-ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 defer cancel()
-if timex.SleepCtx(ctx.Done(), 5*time.Second) {
-    fmt.Println("Süre doldu")
-} else {
-    fmt.Println("Context iptal edildi")
-}
+err := timex.SleepContext(ctx, 5*time.Second)
+fmt.Println(errors.Is(err, context.DeadlineExceeded)) // true
+
+done := make(chan struct{})
+close(done)
+fmt.Println(timex.SleepCtx(done, time.Second))     // false (iptal)
+fmt.Println(timex.SleepCtx(nil, time.Millisecond)) // true (süre doldu)
 ```
 
-## Edge-Case ve Hata Yönetimi
-- MustParseTime: Hatalı string girilirse panic atar.
-- SleepCtx: Süre dolmadan context kapanırsa false döner.
-- EndOfDay: Saniye ve nanosecond hassasiyeti ile gün sonunu döner.
-
-## Notlar
-- Tüm fonksiyonlar time.Time ve time.Duration ile uyumludur.
-- Layout parametreleri Go'nun time paketindeki biçimlere uymalıdır.
-- Daha fazla detay için kodu inceleyebilirsiniz.
+- `SleepContext(ctx, d) error`: süre dolarsa `nil`, iptal edilirse
+  `ctx.Err()`. Önceden iptal edilmiş ctx hemen hata döner.
+- `SleepCtx(done, d) bool`: süre dolarsa `true`, iptal edilirse `false`.
+  Kanal zaten kapalıysa (d ne olursa olsun) iptal önceliklidir. Yeni kodda
+  `SleepContext` tercih edin.

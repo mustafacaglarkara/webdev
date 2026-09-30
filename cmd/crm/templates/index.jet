@@ -1,0 +1,22 @@
+<section>
+  <h1>{{ t(ctx, "home.title") }}</h1>
+  <p class="lead">{{ t(ctx, "home.lead") }}</p>
+  {{- if IsAuthenticated }}
+  <p>{{ t(ctx, "home.welcome_user", dict("Name", UserName)) }}</p>
+  {{- else }}
+  <p>{{ t(ctx, "home.guest_hint") }} <a href="{{ route("auth.login") }}">{{ t(ctx, "nav.login") }}</a></p>
+  {{- end }}
+
+  <h2>{{ t(ctx, "home.features_title") }}</h2>
+  <ul class="features">
+    <li>{{ t(ctx, "home.feature.auth") }}</li>
+    <li>{{ t(ctx, "home.feature.policy") }}</li>
+    <li>{{ t(ctx, "home.feature.i18n") }}</li>
+    <li>{{ t(ctx, "home.feature.menu") }}</li>
+    <li>{{ t(ctx, "home.feature.forms") }}</li>
+  </ul>
+
+  {{- if can(ctx, "/admin", "GET") }}
+  <p class="note">{{ t(ctx, "home.admin_hint") }} <a href="{{ route("admin.dashboard") }}">{{ t(ctx, "menu.admin") }}</a></p>
+  {{- end }}
+</section>

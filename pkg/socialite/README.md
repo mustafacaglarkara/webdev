@@ -1,81 +1,80 @@
 # socialite
 
-OAuth ile sosyal giriş (Google, Facebook, vs.) için yardımcı katman. Laravel Socialite benzeri, Go'da en çok kullanılan çözüm: [markbates/goth](https://github.com/markbates/goth)
-
----
-
-## 1. Provider Kurulumu ve Kayıt
+[markbates/goth](https://github.com/markbates/goth) üzerine Laravel Socialite
+benzeri ince OAuth katmanı (Google, GitHub, Facebook ...).
 
 ```go
-import (
-    "github.com/markbates/goth/providers/google"
-    "your/module/path/pkg/socialite"
-)
+import "github.com/mustafacaglarkara/webdev/pkg/socialite"
+```
+
+## 1. Oturum deposu
+
+goth, OAuth `state` ve sağlayıcı oturumunu bir `sessions.Store` içinde tutar.
+Uygulama başlangıcında (istekler gelmeden önce) bir depo ayarlayın:
+
+```go
+// Güvenli varsayılanlı cookie store: HttpOnly, SameSite=Lax, 10 dk ömür
+_, err := socialite.UseCookieStore(true /* secure: HTTPS */, []byte(os.Getenv("OAUTH_SESSION_KEY")))
+if err != nil { // anahtar boşsa socialite.ErrNoKeys
+	log.Fatal(err)
+}
+
+// veya kendi deponuz
+_ = socialite.SetStore(myRedisStore) // nil ise socialite.ErrNilStore
+```
+
+Hiçbiri çağrılmazsa goth, `SESSION_SECRET` ortam değişkeninden bir cookie store
+kurar; değişken boşsa akış çalışmaz.
+
+## 2. Sağlayıcılar
+
+```go
+import "github.com/markbates/goth/providers/google"
+
 socialite.SetupProviders(
-    google.New("client_id", "client_secret", "http://localhost:3000/auth/google/callback"),
+	google.New(clientID, clientSecret, "https://ornek.com/auth/google/callback"),
 )
 ```
 
----
-
-## 2. Auth Akışı: Başlatma ve Callback
-
-### a) Giriş Akışını Başlatma (BeginAuthHandler)
+## 3. Akış
 
 ```go
-import "your/module/path/pkg/socialite"
-
 http.HandleFunc("/auth/google", socialite.BeginAuthHandler("google"))
+
+http.HandleFunc("/auth/google/callback", socialite.CallbackHandler("google",
+	func(w http.ResponseWriter, r *http.Request, user goth.User) {
+		// user.Email, user.Name, user.Provider, user.AccessToken, user.RawData ...
+		// Kendi oturumunuzu burada başlatın.
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	}))
+
+http.HandleFunc("/auth/logout", socialite.LogoutHandler("/")) // goth oturumunu siler, 303 ile "/"a döner
 ```
 
-### b) Callback ve Kullanıcı Bilgisi Alma
+## 4. Hata yönetimi
+
+- `CallbackHandler` hata durumunda **ham sağlayıcı hatasını istemciye göndermez**:
+  hata `slog` ile loglanır, yanıt `401 Kimlik doğrulama başarısız` olur.
+- `onSuccess` `nil` ise panik yerine `500 Sunucu yapılandırma hatası` döner
+  (`ErrNilCallback`).
+- Kendi davranışınız için `CallbackHandlerWithError`:
 
 ```go
-import (
-    "fmt"
-    "your/module/path/pkg/socialite"
-)
-
-http.HandleFunc("/auth/google/callback", socialite.CallbackHandler("google", func(w http.ResponseWriter, r *http.Request, user goth.User) {
-    fmt.Fprintf(w, "Hoş geldin, %s!", user.Name)
-    // user.Email, user.Provider, user.AccessToken, user.RawData ...
-}))
+h := socialite.CallbackHandlerWithError("google", onSuccess,
+	func(w http.ResponseWriter, r *http.Request, err error) {
+		slog.Warn("oauth hatası", "err", err)
+		http.Redirect(w, r, "/giris?hata=oauth", http.StatusSeeOther)
+	})
 ```
 
----
+## 5. Çıkış
 
-## 3. Facebook ve Diğer Sağlayıcılar
-
-```go
-import "github.com/markbates/goth/providers/facebook"
-socialite.SetupProviders(
-    facebook.New("client_id", "client_secret", "http://localhost:3000/auth/facebook/callback"),
-)
-http.HandleFunc("/auth/facebook", socialite.BeginAuthHandler("facebook"))
-http.HandleFunc("/auth/facebook/callback", socialite.CallbackHandler("facebook", ...))
-```
-
----
-
-## 4. Edge-Case ve Hata Yönetimi
-
-- Callback'te hata olursa: 401 Unauthorized ve hata mesajı döner.
-- Eksik/yanlış client_id, secret veya callback: Sağlayıcıdan hata döner, callback'te yakalanır.
-- Kullanıcı iptal ederse veya erişim vermezse: gothic.CompleteUserAuth hata döner.
-- Birden fazla provider için aynı anda SetupProviders ile tanımlayabilirsiniz.
-
----
-
-## 5. Test ve Gelişmiş Senaryolar
-
-- Testte: local provider ile mock akış kurabilirsiniz.
-- Callback'te user.RawData ile sağlayıcıdan dönen tüm veriye erişebilirsiniz.
-- JWT veya session ile login sonrası kendi kullanıcı sisteminize bağlayabilirsiniz.
-- HTTPS zorunluluğu: production ortamında callback URL'leriniz HTTPS olmalı.
-
----
+`socialite.Logout(w, r)` yalnızca goth'un OAuth oturum verisini temizler;
+uygulamanızın kendi kullanıcı oturumunu ayrıca temizlemeniz gerekir.
+`LogoutHandler(redirectTo)` bunu bir handler olarak sunar (`redirectTo` boşsa `/`).
 
 ## Notlar
-- Google, Facebook, Github, Twitter, Discord, vs. için provider'lar goth ile hazırdır.
-- socialite paketi thread-safe'dir, handler'lar paralel çalışabilir.
-- Daha fazla detay ve gelişmiş kullanım için goth dökümantasyonuna bakınız.
+
+- Üretimde callback URL'leri HTTPS olmalı ve `UseCookieStore(true, ...)` kullanılmalıdır.
+- `SetupProviders`/`SetStore` goth'un paket globallerini değiştirir; yalnızca başlangıçta çağırın.
+- Testlerde goth'un `providers/faux` sağlayıcısı ile tam akış denenebilir (bkz. `socialite_test.go`).

@@ -4,204 +4,215 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
-
-	"github.com/gofiber/fiber/v2"
+	"sync"
+	"unicode/utf8"
 )
 
 const oldSessionKey = "old_form"
 
+// Old input limitleri (çerez ~4KB sınırının altında kalmak için). Paket globalleri
+// kilit altında tutulur (WEB-15); SetOldInputLimits / OldInputLimits ile erişin.
 var (
-	OldInputsMaxJSONSize      = 2048 // max JSON length before truncation strategies
-	OldInputsTruncatePerValue = 256  // per value truncate length in strategy 1
-	OldInputsTruncateFirstVal = 128  // first value truncate length in strategy 2
+	oldLimitsMu        sync.RWMutex
+	oldMaxJSONSize     = 2048 // JSON bu uzunluğu aşarsa kısaltma stratejileri uygulanır
+	oldTruncatePerVal  = 256  // strateji 1: her değerin azami bayt uzunluğu
+	oldTruncateFirstVa = 128  // strateji 2: yalnızca ilk değer, azami bayt uzunluğu
+
+	sensitiveMu sync.RWMutex
+	// alan adında geçmesi yeterli olan (uzun) desenler
+	sensitivePatterns = []string{"password", "passwd", "secret", "token", "csrf", "creditcard", "credit_card", "cardnumber", "card_number", "iban"}
+	// alan adının ayırıcılarla (_ - . [ ]) bölünmüş parçalarından biri tam eşleşmeli (kısa) desenler
+	sensitiveWords = map[string]struct{}{"pwd": {}, "pass": {}, "card": {}, "cvv": {}, "cvc": {}, "ssn": {}, "otp": {}, "pin": {}}
 )
 
-// SetOldInputLimits allows overriding global limits (use with caution in init/test code)
+// SetOldInputLimits global limitleri değiştirir (<= 0 olan değerler değişmez).
 func SetOldInputLimits(maxJSON, perValue, firstValue int) {
+	oldLimitsMu.Lock()
+	defer oldLimitsMu.Unlock()
 	if maxJSON > 0 {
-		OldInputsMaxJSONSize = maxJSON
+		oldMaxJSONSize = maxJSON
 	}
 	if perValue > 0 {
-		OldInputsTruncatePerValue = perValue
+		oldTruncatePerVal = perValue
 	}
 	if firstValue > 0 {
-		OldInputsTruncateFirstVal = firstValue
+		oldTruncateFirstVa = firstValue
 	}
 }
 
-// SetOldInputs stores ALL submitted form values (after size safeguards) into the flash session.
-// It serializes url.Values as JSON. Size is bounded by truncation logic below to keep cookie < ~4KB.
+// OldInputLimits geçerli limitleri döner (testlerde geri yüklemek için).
+func OldInputLimits() (maxJSON, perValue, firstValue int) {
+	oldLimitsMu.RLock()
+	defer oldLimitsMu.RUnlock()
+	return oldMaxJSONSize, oldTruncatePerVal, oldTruncateFirstVa
+}
+
+// AddSensitiveFieldPatterns old input'a ASLA yazılmayacak alan adı parçalarını ekler
+// (küçük harf, "içerir" eşleşmesi).
+func AddSensitiveFieldPatterns(patterns ...string) {
+	sensitiveMu.Lock()
+	defer sensitiveMu.Unlock()
+	for _, p := range patterns {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p != "" {
+			sensitivePatterns = append(sensitivePatterns, p)
+		}
+	}
+}
+
+// IsSensitiveField alan adı parola, token, kart vb. hassas bir alan gibi görünüyorsa true döner.
+// "İçerir" desenleri: password, passwd, secret, token, csrf, creditcard, cardnumber, iban.
+// Tam parça desenleri (ad _ - . [ ] ile bölünür): pwd, pass, card, cvv, cvc, ssn, otp, pin.
+// "card" ile başlayan adlar da (cardNumber, card_exp) hassastır.
+func IsSensitiveField(name string) bool {
+	n := strings.ToLower(name)
+	if strings.HasPrefix(n, "card") {
+		return true
+	}
+	sensitiveMu.RLock()
+	defer sensitiveMu.RUnlock()
+	for _, p := range sensitivePatterns {
+		if strings.Contains(n, p) {
+			return true
+		}
+	}
+	for _, part := range strings.FieldsFunc(n, func(r rune) bool {
+		return r == '_' || r == '-' || r == '.' || r == '[' || r == ']' || r == ' '
+	}) {
+		if _, ok := sensitiveWords[part]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// truncateBytes s'yi en fazla n bayta, rune bölmeden kısaltır.
+func truncateBytes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	cut := n
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+// EncodeOldInputs formu old input olarak saklanacak JSON'a çevirir: hassas alanlar
+// atılır, boyut limiti her durumda uygulanır, kısaltma rune güvenlidir (WEB-11).
+// Saklanacak alan kalmazsa "" döner.
+func EncodeOldInputs(form url.Values) (string, error) {
+	maxSize, perValue, firstVal := OldInputLimits()
+
+	clean := url.Values{}
+	for k, vals := range form {
+		if IsSensitiveField(k) {
+			continue
+		}
+		clean[k] = append([]string(nil), vals...)
+	}
+	if len(clean) == 0 {
+		return "", nil
+	}
+	b, err := json.Marshal(clean)
+	if err != nil {
+		return "", err
+	}
+	if len(b) <= maxSize {
+		return string(b), nil
+	}
+	// Strateji 1: değer başına kısaltma
+	reduced := url.Values{}
+	for k, vals := range clean {
+		for _, v := range vals {
+			reduced.Add(k, truncateBytes(v, perValue))
+		}
+	}
+	if b, err = json.Marshal(reduced); err != nil {
+		return "", err
+	}
+	if len(b) <= maxSize {
+		return string(b), nil
+	}
+	// Strateji 2: yalnızca ilk değer, daha kısa
+	mini := url.Values{}
+	for k, vals := range clean {
+		v := ""
+		if len(vals) > 0 {
+			v = truncateBytes(vals[0], firstVal)
+		}
+		mini.Set(k, v)
+	}
+	if b, err = json.Marshal(mini); err != nil {
+		return "", err
+	}
+	if len(b) <= maxSize {
+		return string(b), nil
+	}
+	// Strateji 3: sığan alanları (ada göre sıralı) ekle, gerisini at
+	keys := make([]string, 0, len(mini))
+	for k := range mini {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	fit := url.Values{}
+	best := ""
+	for _, k := range keys {
+		fit.Set(k, mini.Get(k))
+		bb, err := json.Marshal(fit)
+		if err != nil {
+			return "", err
+		}
+		if len(bb) > maxSize {
+			fit.Del(k)
+			continue
+		}
+		best = string(bb)
+	}
+	return best, nil
+}
+
+// SetOldInputs gönderilen form değerlerini (hassas alanlar hariç, boyut sınırlı) flash
+// oturumuna yazar; sonraki istekte GetOldInputs ile okunur.
 func SetOldInputs(w http.ResponseWriter, r *http.Request, form url.Values) error {
-	s := getStore()
-	sess, err := s.Get(r, flashSessionName)
+	enc, err := EncodeOldInputs(form)
 	if err != nil {
 		return err
 	}
-	b, err := json.Marshal(form)
+	sess, err := getSession(r, flashSessionName)
 	if err != nil {
 		return err
 	}
-	// Prevent extremely large session cookies: if JSON too big, truncate values
-	maxSize := OldInputsMaxJSONSize
-	if len(b) > maxSize {
-		// Strategy 1: per-value truncation
-		reduced := url.Values{}
-		for k, vals := range form {
-			for _, v := range vals {
-				if len(v) > OldInputsTruncatePerValue {
-					v = v[:OldInputsTruncatePerValue]
-				}
-				reduced.Add(k, v)
-			}
-		}
-		b2, err2 := json.Marshal(reduced)
-		if err2 == nil && len(b2) <= maxSize {
-			sess.Values[oldSessionKey] = string(b2)
-			return sess.Save(r, w)
-		}
-		// Strategy 2: first value only
-		mini := url.Values{}
-		for k, vals := range form {
-			v := ""
-			if len(vals) > 0 {
-				v = vals[0]
-				if len(v) > OldInputsTruncateFirstVal {
-					v = v[:OldInputsTruncateFirstVal]
-				}
-			}
-			mini.Set(k, v)
-		}
-		b3, _ := json.Marshal(mini)
-		sess.Values[oldSessionKey] = string(b3)
-		return sess.Save(r, w)
+	if enc == "" {
+		delete(sess.Values, oldSessionKey)
+	} else {
+		sess.Values[oldSessionKey] = enc
 	}
-	sess.Values[oldSessionKey] = string(b)
 	return sess.Save(r, w)
 }
 
-// GetOldInputs retrieves old form values (consumes them) similar to flash messages.
+// GetOldInputs önceki form değerlerini döner ve (flash gibi) tüketir.
 func GetOldInputs(w http.ResponseWriter, r *http.Request) (url.Values, error) {
-	s := getStore()
-	sess, err := s.Get(r, flashSessionName)
+	sess, err := getSession(r, flashSessionName)
 	if err != nil {
 		return nil, err
 	}
-	if v, ok := sess.Values[oldSessionKey].(string); ok {
-		var vals url.Values
-		if err := json.Unmarshal([]byte(v), &vals); err != nil {
-			var mm map[string][]string
-			if err2 := json.Unmarshal([]byte(v), &mm); err2 == nil {
-				vals = url.Values(mm)
-			} else {
-				return nil, err
-			}
-		}
-		delete(sess.Values, oldSessionKey)
-		if err := sess.Save(r, w); err != nil {
-			return vals, err
-		}
-		return vals, nil
-	}
-	return url.Values{}, nil
-}
-
-// Fiber wrappers -------------------------------------------------------------
-
-// FiberSetOldInputs stores form values into Fiber context locals as pending old inputs.
-// It no longer saves to session immediately. The pending inputs will be merged into the
-// session by FiberSetFlash (when redirecting) or can be committed explicitly via FiberCommitOldInputs.
-func FiberSetOldInputs(c *fiber.Ctx, form url.Values) error {
-	c.Locals("pending_old_inputs", form)
-	return nil
-}
-
-// FiberCommitOldInputs writes pending_old_inputs (if any) into the session and applies Set-Cookie headers.
-// Returns nil if there were no pending inputs.
-func FiberCommitOldInputs(c *fiber.Ctx) error {
-	v := c.Locals("pending_old_inputs")
-	if v == nil {
-		return nil
-	}
-	form, ok := v.(url.Values)
+	v, ok := sess.Values[oldSessionKey].(string)
 	if !ok {
-		return nil
+		return url.Values{}, nil
 	}
-	w := &fiberResponseWriter{c: c}
-	r, _ := http.NewRequest(c.Method(), c.OriginalURL(), nil)
-	c.Request().Header.VisitAll(func(k, v []byte) {
-		r.Header.Set(string(k), string(v))
-	})
-	if err := SetOldInputs(w, r, form); err != nil {
-		return err
+	delete(sess.Values, oldSessionKey)
+	var vals url.Values
+	if uerr := json.Unmarshal([]byte(v), &vals); uerr != nil {
+		vals = url.Values{}
 	}
-	w.applyHeaders()
-	// clear pending
-	c.Locals("pending_old_inputs", nil)
-	return nil
-}
-
-// FiberGetOldInputs retrieves old form values (consumes them) using Fiber context and applies Set-Cookie headers.
-func FiberGetOldInputs(c *fiber.Ctx) (url.Values, error) {
-	w := &fiberResponseWriter{c: c}
-	r, _ := http.NewRequest(c.Method(), c.OriginalURL(), nil)
-	c.Request().Header.VisitAll(func(k, v []byte) {
-		r.Header.Set(string(k), string(v))
-	})
-	vals, err := GetOldInputs(w, r)
-	w.applyHeaders()
-	return vals, err
-}
-
-// FiberOld returns the old value for a key. It caches the loaded old inputs into c.Locals so multiple
-// calls in a template don't trigger repeated session reads.
-func FiberOld(c *fiber.Ctx, key string) string {
-	if v, ok := c.Locals("old_form_cache").(url.Values); ok {
-		return v.Get(key)
+	if err := sess.Save(r, w); err != nil {
+		return vals, err
 	}
-	vals, _ := FiberGetOldInputs(c)
-	c.Locals("old_form_cache", vals)
-	return vals.Get(key)
-}
-
-// FiberOldAll returns all old inputs (and caches them).
-func FiberOldAll(c *fiber.Ctx) url.Values {
-	if v, ok := c.Locals("old_form_cache").(url.Values); ok {
-		return v
-	}
-	vals, _ := FiberGetOldInputs(c)
-	c.Locals("old_form_cache", vals)
-	return vals
-}
-
-// FiberAutoOldInputs is a middleware that automatically captures form inputs on unsafe methods
-// and, if the handler returned a redirect (3xx), stores them into the session as old inputs
-// for the next request (so templates can use old(ctx, "field")).
-func FiberAutoOldInputs() fiber.Handler {
-	return func(c *fiber.Ctx) error {
-		m := c.Method()
-		if m != fiber.MethodPost && m != fiber.MethodPut && m != "PATCH" {
-			return c.Next()
-		}
-		ct := c.Get("Content-Type")
-		if ct == "" || !(strings.Contains(ct, "application/x-www-form-urlencoded") || strings.Contains(ct, "multipart/form-data")) {
-			return c.Next()
-		}
-		// collect form values
-		vals := url.Values{}
-		c.Request().PostArgs().VisitAll(func(k, v []byte) {
-			key := string(k)
-			vals.Add(key, string(v))
-		})
-		// run handler
-		err := c.Next()
-		// after handler, if redirect (3xx) then store old inputs (only if not already set by handler)
-		status := c.Response().StatusCode()
-		if status >= 300 && status < 400 {
-			if c.Locals("pending_old_inputs") == nil { // avoid duplicate
-				_ = FiberSetOldInputs(c, vals)
-			}
-		}
-		return err
-	}
+	return vals, nil
 }

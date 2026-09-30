@@ -1,0 +1,10 @@
+p, guest, /, GET
+p, guest, /about, GET
+p, guest, /demo/menu, GET
+p, guest, /forms/demo, *
+p, user, /user, GET
+p, user, /api/me, GET
+p, admin, /admin, GET
+p, admin, /admin/*, GET
+g, user, guest
+g, admin, user

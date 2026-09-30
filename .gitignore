@@ -24,5 +24,13 @@ coverage.*
 # Vendor (if used)
 vendor/
 yapilacaklar/
-yapilackalar/
 001_depo/
+
+# Yerel veritabanları
+*.db
+*.db-journal
+*.sqlite
+
+# Ortam dosyaları
+.env
+.env.*

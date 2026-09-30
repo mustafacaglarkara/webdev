@@ -1,138 +1,90 @@
-Aşağıda proje için kullanılacak `README.md` içeriği yer alıyor. Kısa kullanım örnekleri ve `pkg` altındaki paketler için genel açıklamalar içerir.
+# collection
 
-```markdown
-# Proje Başlığı
-
-Kısa açıklama: Bu proje Go ile yazılmıştır. Yardımcı paketler `pkg` dizini altında toplanmıştır. Örnek olarak `pkg/collection` içinde genel amaçlı slice yardımcıları bulunur (ör: `pkg/collection/slice.go`).
-
-## Gereksinimler
-
-`go` (1.18+ önerilir) ve bir Go modül yapılandırması (`go.mod`) gereklidir.
-
-## Kurulum
-
-Aşağıdaki komutlarla projeyi klonlayın ve bağımlılıkları indirin:
-
-```bash
-git clone <repository-url>
-cd <repository-directory>
-go mod download
+```go
+import "github.com/mustafacaglarkara/webdev/pkg/collection"
 ```
 
-## Derleme ve Çalıştırma
+Generic slice yardımcıları: arama, indeks, tekrar temizleme, parçalama ve iki
+listeyi koşula göre karşılaştırma. Örnek çıktıları `example_test.go` ile
+doğrulanır.
 
-Projeyi derlemek için:
-
-```bash
-go build ./...
-```
-
-Örnek uygulamayı çalıştırmak için (ana paket varsa):
-
-```bash
-go run ./cmd/yourapp
-```
-
-## Testler
-
-Tüm testleri çalıştırmak için:
-
-```bash
-go test ./...
-```
-
-## `pkg` Dizin Yapısı ve Kullanım
-
-Tüm yardımcı paketler `pkg` altında tutulur. Örnek: `pkg/collection` paketi generic slice yardımcıları sağlar.
-
-### collection paketi
-
-Go 1.18+ ile generic olarak slice (dilim) işlemleri için yardımcı fonksiyonlar sunar. Bu paket ile slice içinde arama, indeks bulma, tekrar edenleri temizleme, parçalara ayırma ve iki listeyi koşula göre karşılaştırma işlemlerini kolayca yapabilirsiniz.
-
-## Fonksiyonlar ve Kullanım Örnekleri
-
-### Contains
-Bir slice içinde bir değerin olup olmadığını kontrol eder.
+## Contains / IndexOf / Dedup
 
 ```go
 arr := []int{1, 2, 3, 2}
-collection.Contains(arr, 2) // true
-collection.Contains(arr, 5) // false
+fmt.Println(collection.Contains(arr, 2), collection.Contains(arr, 5)) // true false
+fmt.Println(collection.IndexOf(arr, 3), collection.IndexOf(arr, 5))   // 2 -1
+fmt.Println(collection.Dedup(arr))                                    // [1 2 3]
 ```
 
-### IndexOf
-Bir değerin slice içindeki ilk indeksini döner. Yoksa -1 döner.
+`Dedup` ilk görülme sırasını korur ve her zaman yeni bir slice döner (girdi
+değişmez).
+
+## Chunk
+
+Slice'ı en fazla `n` elemanlı parçalara böler; son parça daha kısa olabilir.
+`n <= 0` veya boş girdi için boş (nil olmayan) slice döner.
 
 ```go
-arr := []int{1, 2, 3, 2}
-collection.IndexOf(arr, 3) // 2
-collection.IndexOf(arr, 5) // -1
+fmt.Println(collection.Chunk([]int{1, 2, 3, 4, 5, 6, 7}, 3)) // [[1 2 3] [4 5 6] [7]]
+fmt.Println(collection.Chunk([]int{1, 2}, 0))                // []
 ```
 
-### Dedup
-Bir slice içindeki tekrar eden değerleri kaldırır, sıralamayı korur.
+Parçalar girdinin alt dilimleridir (kopya değildir) ama kapasiteleri
+sınırlıdır: bir parçaya `append` yapmak sonraki parçanın elemanlarını ezmez.
+Parça elemanlarını yerinde değiştirmek girdiyi de değiştirir.
+
+## CompareByTyped
+
+İki slice'ı verilen karşılaştırıcıya göre eşleştirir, tip bilgisini korur.
+`a`'daki her eleman `b`'de henüz eşleşmemiş ilk uygun elemanla eşleşir (her
+`b` elemanı en fazla bir kez kullanılır). Dönenler: eşleşen çiftler
+(`[]Pair[T, U]`, `a` sırasıyla), yalnızca `a`'da olanlar, yalnızca `b`'de
+olanlar. Karmaşıklık `O(len(a) * len(b))`.
 
 ```go
-arr := []int{1, 2, 3, 2}
-collection.Dedup(arr) // [1 2 3]
+// Türkçe duyarlı büyük/küçük harf eşitliği (pkg/text).
+listA := []string{"Ali", "Veli", "Ayşe", "IŞIK"}
+listB := []string{"ali", "Fatma", "VELİ", "ışık"}
+eq := func(a, b string) bool { return text.ToLowerTR(a) == text.ToLowerTR(b) }
+matches, onlyA, onlyB := collection.CompareByTyped(listA, listB, eq)
+for _, m := range matches {
+    fmt.Println(m.A, "=", m.B)
+}
+fmt.Println(onlyA, onlyB)
+// Ali = ali
+// Veli = VELİ
+// IŞIK = ışık
+// [Ayşe] [Fatma]
 ```
 
-### Chunk
-Bir slice'ı belirli boyutlarda parçalara böler. Son parça eksikse kalan elemanlarla döner.
+Not: `strings.EqualFold("Veli", "VELİ")` Türkçe `İ` nedeniyle `false` döner;
+Türkçe metinlerde `text.ToLowerTR` ile karşılaştırın.
+
+Farklı tipler:
 
 ```go
-arr := []int{1, 2, 3, 4, 5, 6, 7}
-chunks := collection.Chunk(arr, 3)
-// chunks: [[1 2 3] [4 5 6] [7]]
-collection.Chunk(arr, 0) // []
-collection.Chunk([]int{}, 2) // []
-```
+type User struct {
+    ID   int
+    Name string
+}
+type Person struct{ FullName string }
 
-### CompareBy
-İki slice'ı, verdiğiniz karşılaştırıcıya göre karşılaştırır. Eşleşen çiftleri, sadece ilk listede olanları ve sadece ikinci listede olanları döner.
-
-```go
-// İki string listesini küçük/büyük harf duyarsız karşılaştır
-listA := []string{"Ali", "Veli", "Ayşe"}
-listB := []string{"ali", "Fatma", "VELİ"}
-matches, onlyA, onlyB := collection.CompareBy(listA, listB, func(a, b string) bool {
-    return strings.EqualFold(a, b)
-})
-// matches: [[Ali ali] [Veli VELİ]]
-// onlyA: [Ayşe]
-// onlyB: [Fatma]
-
-// Farklı tipler ve koşullar için de kullanılabilir:
-type User struct {ID int; Name string}
-type Person struct {FullName string}
 users := []User{{1, "Ali"}, {2, "Veli"}}
 persons := []Person{{"Ali"}, {"Ayşe"}}
-_, onlyUsers, onlyPersons := collection.CompareBy(users, persons, func(u User, p Person) bool {
+matches, onlyUsers, onlyPersons := collection.CompareByTyped(users, persons, func(u User, p Person) bool {
     return u.Name == p.FullName
 })
-// onlyUsers: [{2 Veli}]
-// onlyPersons: [{Ayşe}]
+fmt.Println(matches[0].A.ID, matches[0].B.FullName) // 1 Ali
+fmt.Println(onlyUsers, onlyPersons)                 // [{2 Veli}] [{Ayşe}]
 ```
 
-## Notlar
-- Tüm fonksiyonlar generic olarak çalışır (Go 1.18+ gerektirir).
-- Chunk fonksiyonu n<=0 veya boş slice için [] döner.
-- CompareBy ile karmaşık eşleştirme ve farklı tipler arası karşılaştırma yapılabilir.
-- Daha fazla detay için kodu inceleyebilirsiniz.
+## CompareBy (eski)
 
-## Yeni `pkg` Paketleri Eklerken
+`CompareBy` aynı eşleştirmeyi yapar ama eşleşmeleri `[][2]any` olarak döner.
+**Deprecated:** yeni kodda `CompareByTyped` kullanın.
 
-- Her pakete kısa bir açıklama ekleyin.
-- Paket içindeki fonksiyonlar için örnek kullanım sağlayın (ör: `example_test.go` veya README).
-- Birimler için test yazın (`*_test.go`).
-
-## Katkıda Bulunma
-
-Basit PR, issue veya branch ile katkı yapılabilir. Kod stiline ve test kapsamına dikkat edin.
-
-## Lisans
-
-Projenin lisansı burada belirtilmelidir.
+```go
+matches, onlyA, onlyB := collection.CompareBy([]string{"Ali", "Veli"}, []string{"ali", "Fatma"}, strings.EqualFold)
+fmt.Println(matches, onlyA, onlyB) // [[Ali ali]] [Veli] [Fatma]
 ```
-````
-

@@ -2,13 +2,9 @@ package db
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io/fs"
-	"path/filepath"
-	"reflect"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,10 +17,11 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/driver/sqlserver"
 
-	// logging & retry
 	"github.com/google/uuid"
 	"github.com/mustafacaglarkara/webdev/pkg/logx"
+	"github.com/mustafacaglarkara/webdev/pkg/migrate"
 	"github.com/mustafacaglarkara/webdev/pkg/resilience"
+	"github.com/mustafacaglarkara/webdev/pkg/sqlutil"
 )
 
 type Config struct {
@@ -33,12 +30,17 @@ type Config struct {
 	MaxOpenConns    int
 	MaxIdleConns    int
 	ConnMaxLifetime time.Duration
-	// Retry ve log seçenekleri
+	// Retry ve log seçenekleri.
+	// Yalnızca geçici hatalar (bağlantı kopması, deadlock, serialization,
+	// SQLite busy; okumalarda ayrıca zaman aşımı) yeniden denenir.
+	// Yazma işlemleri ve transaction'lar yalnızca RetryWrites=true veya
+	// WithWriteRetry(ctx, true) ile yeniden denenir.
 	RetryAttempts int           // <=1 ise retry kapalı
 	RetryDelay    time.Duration // denemeler arası bekleme
+	RetryWrites   bool          // yazma/transaction yeniden denemesine izin ver (işlemler idempotent olmalı)
 	EnableLogging bool          // Exec/Query log/ölçüm
 	SlowThreshold time.Duration // yavaş sorgu eşiği (0 ise kapalı)
-	// Circuit Breaker
+	// Circuit Breaker. Kayıt bulunamadı, kısıt ihlali ve context iptali hata sayılmaz.
 	EnableBreaker        bool
 	BreakerFailThreshold int
 	BreakerOpenTimeout   time.Duration
@@ -46,181 +48,112 @@ type Config struct {
 	ConnLabel    string // örn. "primary" veya "reporting"
 	DatabaseName string // isteğe bağlı; loglara eklenir
 	// Prepared statement & cache (opsiyonel)
-	EnableStmtCache bool // true ise PrepareCached kullanılır
-	StmtCacheSize   int  // 0 veya <0 => sınırsız (LRU yok basit map)
+	EnableStmtCache bool // true ise ExecPrepared/QueryPrepared *sql.Stmt cache'i kullanır
+	StmtCacheSize   int  // <= 0 => sınırsız; aksi halde LRU
+}
+
+// runtime: Init ile oluşturulan değişmez durum anlık görüntüsü.
+type runtime struct {
+	db      *gorm.DB
+	cfg     Config
+	cb      *resilience.CircuitBreaker
+	cache   *stmtCache
+	dialect sqlutil.Dialect
 }
 
 var (
-	mu         sync.RWMutex
-	defaultDB  *gorm.DB
-	defaultCfg Config
-	cb         *resilience.CircuitBreaker
-	stmtMu     sync.RWMutex
-	// maps concrete bound SQL (with ? placeholders) -> prepared *sql.Stmt
-	stmtCache   = make(map[string]*sql.Stmt)
-	stmtMetrics = struct{ prepares, hits int64 }{}
+	mu  sync.RWMutex
+	cur *runtime
 )
 
-// Init: Verilen yapılandırma ile global veritabanı bağlantısını başlatır. Tek sefer çağrılmalıdır.
+var errNotInit = errors.New("db.Init çağrılmamış")
+
+func current() (*runtime, error) {
+	mu.RLock()
+	rt := cur
+	mu.RUnlock()
+	if rt == nil || rt.db == nil {
+		return nil, errNotInit
+	}
+	return rt, nil
+}
+
+// Init: Verilen yapılandırma ile global veritabanı bağlantısını başlatır.
+// Yeniden çağrılırsa önceki bağlantı ve statement cache kapatılır.
 func Init(cfg Config) error {
 	db, err := openDB(cfg)
 	if err != nil {
 		return err
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	// Önceden açılmışsa kapat
-	if defaultDB != nil {
-		_ = closeDB(defaultDB)
-	}
-	defaultDB = db
-	defaultCfg = cfg
+	rt := &runtime{db: db, cfg: cfg, dialect: dialectFromName(driverName(db))}
 	if cfg.EnableBreaker {
-		cb = resilience.NewCircuitBreaker(cfg.BreakerFailThreshold, cfg.BreakerOpenTimeout)
-	} else {
-		cb = nil
+		rt.cb = resilience.NewCircuitBreaker(cfg.BreakerFailThreshold, cfg.BreakerOpenTimeout,
+			resilience.WithFailurePredicate(isBreakerFailure))
+	}
+	if cfg.EnableStmtCache {
+		rt.cache = newStmtCache(cfg.StmtCacheSize)
+	}
+	mu.Lock()
+	old := cur
+	cur = rt
+	mu.Unlock()
+	if old != nil {
+		old.shutdown()
 	}
 	return nil
+}
+
+func (rt *runtime) shutdown() error {
+	if rt.cache != nil {
+		rt.cache.closeAll()
+	}
+	return closeDB(rt.db)
 }
 
 // DB: Global *gorm.DB nesnesini döner. Init sonrası kullanılabilir.
 func DB() *gorm.DB {
 	mu.RLock()
 	defer mu.RUnlock()
-	return defaultDB
+	if cur == nil {
+		return nil
+	}
+	return cur.db
 }
 
 // Close: Global veritabanı bağlantısını ve statement cache'i kapatır.
 func Close() error {
 	mu.Lock()
-	defer mu.Unlock()
-	if defaultDB == nil {
+	old := cur
+	cur = nil
+	mu.Unlock()
+	if old == nil {
 		return nil
 	}
-	err := closeDB(defaultDB)
-	defaultDB = nil
-	// close and clear stmt cache
-	stmtMu.Lock()
-	for k, s := range stmtCache {
-		if s != nil {
-			_ = s.Close()
-		}
-		delete(stmtCache, k)
-	}
-	stmtMu.Unlock()
-	return err
+	return old.shutdown()
 }
 
-// prepareAndCache: SQL sorgusunu cache'ler ve gerekirse hazırlar. Statement cache aktifse kullanılır.
-// prepareAndCache prepares a *sql.Stmt for the concrete bound SQL (with ? placeholders)
-// and stores it into stmtCache. Returns the prepared stmt (or nil if caching disabled).
-func prepareAndCache(bound string) (*sql.Stmt, error) {
-	if !defaultCfg.EnableStmtCache {
-		return nil, nil
-	}
-	// fast path: read lock
-	stmtMu.RLock()
-	if s, ok := stmtCache[bound]; ok {
-		stmtMetrics.hits++
-		stmtMu.RUnlock()
-		return s, nil
-	}
-	stmtMu.RUnlock()
-
-	mu.RLock()
-	db := defaultDB
-	mu.RUnlock()
-	if db == nil {
-		return nil, errors.New("db.Init çağrılmamış")
-	}
-	sqlDB, err := db.DB()
-	if err != nil {
-		return nil, err
-	}
-	s, err := sqlDB.PrepareContext(context.Background(), bound)
-	if err != nil {
-		return nil, err
-	}
-
-	stmtMu.Lock()
-	// double-check another goroutine didn't prepare concurrently
-	if existing, ok := stmtCache[bound]; ok {
-		_ = s.Close()
-		stmtMetrics.hits++
-		stmtMu.Unlock()
-		return existing, nil
-	}
-	stmtCache[bound] = s
-	stmtMetrics.prepares++
-	// simple prune if size limit set: remove one arbitrary entry
-	if defaultCfg.StmtCacheSize > 0 && len(stmtCache) > defaultCfg.StmtCacheSize {
-		for k, v := range stmtCache {
-			if k == bound {
-				continue
-			}
-			_ = v.Close()
-			delete(stmtCache, k)
-			break
-		}
-	}
-	stmtMu.Unlock()
-	return s, nil
-}
-
-// StmtMetrics: Statement cache için prepare ve hit sayaçlarını döner.
+// StmtMetrics: Statement cache için prepare ve hit sayaçlarını döner (Init ile sıfırlanır).
 func StmtMetrics() (prepares, hits int64) {
-	stmtMu.RLock()
-	prepares = stmtMetrics.prepares
-	hits = stmtMetrics.hits
-	stmtMu.RUnlock()
-	return
+	mu.RLock()
+	rt := cur
+	mu.RUnlock()
+	if rt == nil || rt.cache == nil {
+		return 0, 0
+	}
+	return rt.cache.prepares.Load(), rt.cache.hits.Load()
 }
 
-// ExecPrepared: Hazırlanmış (prepared) statement ile sorgu çalıştırır. Statement cache aktifse kullanılır.
-// ExecPrepared: tries to prepare the concrete SQL and execute via *sql.Stmt when enabled.
-func ExecPrepared(ctx context.Context, sqlText string, params map[string]any) (int64, error) {
-	db := DB()
-	if db == nil {
-		return 0, errors.New("db.Init çağrılmamış")
-	}
-	ctx = ensureQueryID(ctx)
-	bound, args, err := bindNamedToQ(sqlText, params)
-	if err != nil {
-		return 0, err
-	}
-	// try prepare + exec via *sql.Stmt
-	s, perr := prepareAndCache(bound)
-	if perr == nil && s != nil {
-		res, err := s.ExecContext(ctx, args...)
-		if err != nil {
-			return 0, err
-		}
-		ra, _ := res.RowsAffected()
-		return ra, nil
-	}
-	// fallback to normal ExecString path
-	var rows int64
-	start := time.Now()
-	err = doWithPolicies(ctx, func() error {
-		res := db.WithContext(ctx).Exec(bound, args...)
-		rows = res.RowsAffected
-		return res.Error
-	})
-	logExec(ctx, "exec", bound, args, start, err, rows)
-	return rows, err
-}
-
-// QueryPrepared: Hazırlanmış statement ile sorgu sonucu slice olarak döner. Şu an QueryString'e yönlendirir.
-func QueryPrepared[T any](ctx context.Context, sqlText string, params map[string]any, dest *[]T) error {
-	return QueryString[T](ctx, sqlText, params, dest)
-}
-
-// UpsertOptions: özellikle SQL Server MERGE için ipuçları
+// UpsertOptions: özellikle SQL Server MERGE için ipuçları.
 // Output DSL: seçilecek INSERTED/DELETED kolonlarını tanımlayın; IncludeAction ile $action sütununu ekleyin.
 type UpsertOptions struct {
-	SQLServerTableHint string        // örn. "WITH (HOLDLOCK)"
-	SQLServerOutput    string        // ham OUTPUT dizesi (geriye dönük kullanım)
-	Output             *UpsertOutput // tercih edilen DSL
+	// SQLServerTableHint: yalnızca izinli ipuçları (HOLDLOCK, SERIALIZABLE, UPDLOCK,
+	// ROWLOCK, PAGLOCK, TABLOCK, TABLOCKX, XLOCK, READCOMMITTED, READCOMMITTEDLOCK,
+	// REPEATABLEREAD); örn. "WITH (HOLDLOCK)". Diğerleri hata döner.
+	SQLServerTableHint string
+	// SQLServerOutput: ham OUTPUT dizesi (geriye dönük). Yalnızca
+	// "$action", "INSERTED.kolon", "DELETED.kolon" ve "AS takma_ad" kabul edilir.
+	SQLServerOutput string
+	Output          *UpsertOutput // tercih edilen DSL
 }
 
 type UpsertOutput struct {
@@ -229,34 +162,15 @@ type UpsertOutput struct {
 	DeletedCols   []string // DELETED.col listesi
 }
 
-func (o *UpsertOutput) render() string {
-	if o == nil {
-		return ""
-	}
-	parts := make([]string, 0, 1+len(o.InsertedCols)+len(o.DeletedCols))
-	if o.IncludeAction {
-		parts = append(parts, "$action AS action")
-	}
-	for _, c := range o.InsertedCols {
-		parts = append(parts, "INSERTED."+c)
-	}
-	for _, c := range o.DeletedCols {
-		parts = append(parts, "DELETED."+c)
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return "OUTPUT " + strings.Join(parts, ", ")
-}
-
 // Context yardımcıları: trace_id / tx_id / query_id taşıma
 
 type ctxKey string
 
 const (
-	ctxKeyTraceID ctxKey = "trace_id"
-	ctxKeyTxID    ctxKey = "tx_id"
-	ctxKeyQueryID ctxKey = "query_id"
+	ctxKeyTraceID    ctxKey = "trace_id"
+	ctxKeyTxID       ctxKey = "tx_id"
+	ctxKeyQueryID    ctxKey = "query_id"
+	ctxKeyWriteRetry ctxKey = "write_retry"
 )
 
 func WithTraceID(ctx context.Context, id string) context.Context {
@@ -282,7 +196,17 @@ func QueryIDFromCtx(ctx context.Context) (string, bool) {
 	return v, ok
 }
 
+// WithWriteRetry: bu context ile yapılan yazma/transaction çağrıları için
+// geçici hatalarda yeniden denemeyi açar/kapatır (Config.RetryWrites'i ezer).
+// Yalnızca idempotent işlemler için açın.
+func WithWriteRetry(ctx context.Context, enabled bool) context.Context {
+	return context.WithValue(ctx, ctxKeyWriteRetry, enabled)
+}
+
 func ensureQueryID(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if _, ok := QueryIDFromCtx(ctx); ok {
 		return ctx
 	}
@@ -291,57 +215,35 @@ func ensureQueryID(ctx context.Context) context.Context {
 
 // ----- public helpers (global DB ile) -----
 
-// MigrateDir: Bir dizindeki tüm .sql dosyalarını sıralı ve tek transaction ile çalıştırır.
+// MigrateDir: fsys içindeki dir dizininde bulunan migration'ları pkg/migrate
+// ile uygular: sürümler schema_migrations tablosunda takip edilir, yalnızca
+// bekleyen dosyalar artan sürüm sırasıyla ve her biri kendi transaction'ında
+// çalışır. Dosya adları <sürüm>_<ad>.sql veya <sürüm>_<ad>.up.sql olmalıdır
+// (.down.sql dosyaları burada çalıştırılmaz).
 func MigrateDir(ctx context.Context, fsys fs.FS, dir string) error {
-	db := DB()
-	if db == nil {
-		return errors.New("db.Init çağrılmamış")
-	}
-	ctx = ensureQueryID(ctx)
-
-	entries, err := fs.ReadDir(fsys, dir)
+	rt, err := current()
 	if err != nil {
 		return err
 	}
-	files := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		if strings.HasSuffix(strings.ToLower(e.Name()), ".sql") {
-			files = append(files, filepath.Join(dir, e.Name()))
-		}
+	ctx = ensureQueryID(ctx)
+	sqlDB, err := rt.db.DB()
+	if err != nil {
+		return err
 	}
-	sort.Strings(files)
-
-	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		for _, f := range files {
-			sqlText, err := loadSQL(fsys, f)
-			if err != nil {
-				return fmt.Errorf("migration yüklenemedi %s: %w", f, err)
-			}
-			start := time.Now()
-			var rows int64
-			// err değişkenini yeniden tanımlamadan kullan
-			err = doWithPolicies(ctx, func() error {
-				res := tx.Exec(sqlText)
-				rows = res.RowsAffected
-				return res.Error
-			})
-			logExec(ctx, "migrate", sqlText, nil, start, err, rows)
-			if err != nil {
-				return fmt.Errorf("migration çalışmadı %s: %w", f, err)
-			}
-		}
-		return nil
-	})
+	start := time.Now()
+	ran, err := migrate.New(sqlDB, fsys, dir, migrate.WithDialect(rt.dialect), migrate.WithPlainSQL(true)).Up(ctx)
+	names := make([]string, len(ran))
+	for i, m := range ran {
+		names[i] = m.Version + "_" + m.Name
+	}
+	rt.logExec(ctx, "migrate", strings.Join(names, ","), nil, start, err, int64(len(ran)))
+	return err
 }
 
 // ExecSQL: Bir .sql dosyasını okuyup parametrelerle çalıştırır. RowsAffected döner.
 func ExecSQL(ctx context.Context, fsys fs.FS, file string, params map[string]any) (int64, error) {
-	db := DB()
-	if db == nil {
-		return 0, errors.New("db.Init çağrılmamış")
+	if _, err := current(); err != nil {
+		return 0, err
 	}
 	raw, err := loadSQL(fsys, file)
 	if err != nil {
@@ -370,11 +272,12 @@ func SelectSQL[T any](ctx context.Context, fsys fs.FS, file string, params map[s
 	return QuerySQL[T](ctx, fsys, file, params, dest)
 }
 
-// ExecString: .sql dosyası yerine doğrudan metin SQL ile çalışır (${name} destekli)
+// ExecString: metin SQL'i ${name} parametreleriyle çalıştırır. Değerler her
+// zaman bağlanır (SQL metnine yazılmaz).
 func ExecString(ctx context.Context, sqlText string, params map[string]any) (int64, error) {
-	db := DB()
-	if db == nil {
-		return 0, errors.New("db.Init çağrılmamış")
+	rt, err := current()
+	if err != nil {
+		return 0, err
 	}
 	ctx = ensureQueryID(ctx)
 	bound, args, err := bindNamedToQ(sqlText, params)
@@ -383,22 +286,20 @@ func ExecString(ctx context.Context, sqlText string, params map[string]any) (int
 	}
 	var rows int64
 	start := time.Now()
-	err = doWithPolicies(ctx, func() error {
-		res := db.WithContext(ctx).Exec(bound, args...)
+	err = rt.doWithPolicies(ctx, opWrite, func() error {
+		res := rt.db.WithContext(ctx).Exec(bound, args...)
 		rows = res.RowsAffected
 		return res.Error
 	})
-	logExec(ctx, "exec", bound, args, start, err, rows)
+	rt.logExec(ctx, "exec", bound, args, start, err, rows)
 	return rows, err
 }
 
 // QuerySQL: SELECT sonuçlarını `dest`’e yazar.
 func QuerySQL[T any](ctx context.Context, fsys fs.FS, file string, params map[string]any, dest *[]T) error {
-	db := DB()
-	if db == nil {
-		return errors.New("db.Init çağrılmamış")
+	if _, err := current(); err != nil {
+		return err
 	}
-	ctx = ensureQueryID(ctx)
 	raw, err := loadSQL(fsys, file)
 	if err != nil {
 		return err
@@ -406,11 +307,14 @@ func QuerySQL[T any](ctx context.Context, fsys fs.FS, file string, params map[st
 	return QueryString[T](ctx, raw, params, dest)
 }
 
-// QueryString: .sql dosyası yerine doğrudan metin SQL ile SELECT
+// QueryString: metin SQL ile SELECT; sonuçları dest'e yazar.
 func QueryString[T any](ctx context.Context, sqlText string, params map[string]any, dest *[]T) error {
-	db := DB()
-	if db == nil {
-		return errors.New("db.Init çağrılmamış")
+	if dest == nil {
+		return errors.New("db: dest nil olamaz")
+	}
+	rt, err := current()
+	if err != nil {
+		return err
 	}
 	ctx = ensureQueryID(ctx)
 	bound, args, err := bindNamedToQ(sqlText, params)
@@ -418,12 +322,101 @@ func QueryString[T any](ctx context.Context, sqlText string, params map[string]a
 		return err
 	}
 	start := time.Now()
-	var qerr error
-	err = doWithPolicies(ctx, func() error {
-		qerr = db.WithContext(ctx).Raw(bound, args...).Scan(dest).Error
-		return qerr
+	err = rt.doWithPolicies(ctx, opRead, func() error {
+		*dest = (*dest)[:0]
+		return rt.db.WithContext(ctx).Raw(bound, args...).Scan(dest).Error
 	})
-	logExec(ctx, "query", bound, args, start, err, int64(len(*dest)))
+	rt.logExec(ctx, "query", bound, args, start, err, int64(len(*dest)))
+	return err
+}
+
+// ExecPrepared: EnableStmtCache açıksa SQL'i hazırlar (cache'ler) ve *sql.Stmt ile
+// çalıştırır; kapalıysa ExecString ile aynıdır. Hazırlama hatası döndürülür.
+func ExecPrepared(ctx context.Context, sqlText string, params map[string]any) (int64, error) {
+	rt, err := current()
+	if err != nil {
+		return 0, err
+	}
+	if rt.cache == nil {
+		return ExecString(ctx, sqlText, params)
+	}
+	ctx = ensureQueryID(ctx)
+	bound, args, err := bindNamed(sqlText, params, rt.placeholder)
+	if err != nil {
+		return 0, err
+	}
+	sqlDB, err := rt.db.DB()
+	if err != nil {
+		return 0, err
+	}
+	var rows int64
+	start := time.Now()
+	err = rt.doWithPolicies(ctx, opWrite, func() error {
+		e, err := rt.cache.acquire(ctx, sqlDB, bound)
+		if err != nil {
+			return fmt.Errorf("db: prepare: %w", err)
+		}
+		defer rt.cache.release(e)
+		res, err := e.stmt.ExecContext(ctx, args...)
+		if err != nil {
+			return err
+		}
+		rows, _ = res.RowsAffected()
+		return nil
+	})
+	rt.logExec(ctx, "exec_prepared", bound, args, start, err, rows)
+	return rows, err
+}
+
+// QueryPrepared: EnableStmtCache açıksa hazırlanmış statement ile sorgular ve
+// satırları GORM ile dest'e tarar; kapalıysa QueryString ile aynıdır.
+func QueryPrepared[T any](ctx context.Context, sqlText string, params map[string]any, dest *[]T) error {
+	if dest == nil {
+		return errors.New("db: dest nil olamaz")
+	}
+	rt, err := current()
+	if err != nil {
+		return err
+	}
+	if rt.cache == nil {
+		return QueryString[T](ctx, sqlText, params, dest)
+	}
+	ctx = ensureQueryID(ctx)
+	bound, args, err := bindNamed(sqlText, params, rt.placeholder)
+	if err != nil {
+		return err
+	}
+	sqlDB, err := rt.db.DB()
+	if err != nil {
+		return err
+	}
+	start := time.Now()
+	err = rt.doWithPolicies(ctx, opRead, func() error {
+		e, err := rt.cache.acquire(ctx, sqlDB, bound)
+		if err != nil {
+			return fmt.Errorf("db: prepare: %w", err)
+		}
+		defer rt.cache.release(e)
+		rows, err := e.stmt.QueryContext(ctx, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		out := (*dest)[:0]
+		for rows.Next() {
+			var item T
+			if err := rt.db.ScanRows(rows, &item); err != nil {
+				return err
+			}
+			out = append(out, item)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		*dest = out
+		return nil
+	})
+	rt.logExec(ctx, "query_prepared", bound, args, start, err, int64(len(*dest)))
 	return err
 }
 
@@ -438,249 +431,155 @@ func DeleteString(ctx context.Context, sqlText string, params map[string]any) (i
 	return ExecString(ctx, sqlText, params)
 }
 
-// BulkInsertRows: INSERT INTO table (cols...) VALUES (...),(...),...; batchSize<=0 ise dialector’a göre güvenli bir değer seçer.
+// BulkInsertRows: INSERT INTO table (cols...) VALUES (...),(...),...
+// table ve cols tanımlayıcıdır: doğrulanır ve tırnaklanır. rows değerdir: bağlanır.
+// batchSize<=0 ise diyalekte göre güvenli bir değer seçilir; çok büyükse
+// parametre sınırına kırpılır. Birden fazla batch tek transaction içinde çalışır.
 func BulkInsertRows(ctx context.Context, table string, cols []string, rows [][]any, batchSize int) (int64, error) {
-	db := DB()
-	if db == nil {
-		return 0, errors.New("db.Init çağrılmamış")
+	rt, err := current()
+	if err != nil {
+		return 0, err
 	}
-	ctx = ensureQueryID(ctx)
 	if len(cols) == 0 || len(rows) == 0 {
 		return 0, nil
 	}
-	dialect := driverName(db)
-	if batchSize <= 0 {
-		batchSize = defaultBatchSizeFor(dialect, len(cols))
+	bs, err := batchSizeFor(string(rt.dialect), len(cols), batchSize)
+	if err != nil {
+		return 0, err
 	}
-	var total int64
-	for startIdx := 0; startIdx < len(rows); startIdx += batchSize {
-		end := startIdx + batchSize
-		if end > len(rows) {
-			end = len(rows)
-		}
-		chunk := rows[startIdx:end]
-		sqlStr, args := buildInsertSQL(table, cols, chunk)
-		var rowsAff int64
-		start := time.Now()
-		err := doWithPolicies(ctx, func() error {
-			res := db.WithContext(ctx).Exec(sqlStr, args...)
-			rowsAff = res.RowsAffected
-			return res.Error
-		})
-		logExec(ctx, "bulkinsert", sqlStr, args, start, err, rowsAff)
-		if err != nil {
-			return total, err
-		}
-		total += rowsAff
+	stmts, err := buildBatches(len(rows), bs, func(s, e int) (string, []any, error) {
+		return buildInsertSQL(rt.dialect, table, cols, rows[s:e])
+	})
+	if err != nil {
+		return 0, err
 	}
-	return total, nil
+	return rt.execBatches(ensureQueryID(ctx), "bulkinsert", stmts)
 }
 
 // BulkUpsertRows: INSERT ... ON CONFLICT/ON DUPLICATE KEY UPDATE ...
-// sqlserver için MERGE kullanılır.
+// sqlserver için MERGE kullanılır. updateCols boşsa çakışan satırlar değişmez.
 func BulkUpsertRows(ctx context.Context, table string, cols []string, conflictCols []string, updateCols []string, rows [][]any, batchSize int) (int64, error) {
-	db := DB()
-	if db == nil {
-		return 0, errors.New("db.Init çağrılmamış")
-	}
-	ctx = ensureQueryID(ctx)
-	if len(cols) == 0 || len(rows) == 0 {
-		return 0, nil
-	}
-	dialect := driverName(db)
-	if batchSize <= 0 {
-		batchSize = defaultBatchSizeFor(dialect, len(cols))
-	}
-	var total int64
-	for startIdx := 0; startIdx < len(rows); startIdx += batchSize {
-		end := startIdx + batchSize
-		if end > len(rows) {
-			end = len(rows)
-		}
-		chunk := rows[startIdx:end]
-
-		var sqlStr string
-		var args []any
-		var err error
-		if dialect == "sqlserver" {
-			sqlStr, args, err = buildMergeSQLServer(table, cols, conflictCols, updateCols, chunk)
-			if err != nil {
-				return total, err
-			}
-		} else {
-			sqlStr, args = buildInsertSQL(table, cols, chunk)
-			suffix, err2 := buildUpsertSuffix(dialect, conflictCols, updateCols)
-			if err2 != nil {
-				return total, err2
-			}
-			sqlStr += " " + suffix
-		}
-
-		var rowsAff int64
-		start := time.Now()
-		err = doWithPolicies(ctx, func() error {
-			res := db.WithContext(ctx).Exec(sqlStr, args...)
-			rowsAff = res.RowsAffected
-			return res.Error
-		})
-		logExec(ctx, "bulkupsert", sqlStr, args, start, err, rowsAff)
-		if err != nil {
-			return total, err
-		}
-		total += rowsAff
-	}
-	return total, nil
+	return BulkUpsertRowsWithOptions(ctx, table, cols, conflictCols, updateCols, rows, batchSize, nil)
 }
 
 // BulkUpsertRowsWithOptions: SQL Server için MERGE opsiyonları (table hint, OUTPUT) desteği; diğer dialector’larda BulkUpsertRows ile aynı davranır.
 func BulkUpsertRowsWithOptions(ctx context.Context, table string, cols []string, conflictCols []string, updateCols []string, rows [][]any, batchSize int, opts *UpsertOptions) (int64, error) {
-	db := DB()
-	if db == nil {
-		return 0, errors.New("db.Init çağrılmamış")
+	rt, err := current()
+	if err != nil {
+		return 0, err
 	}
-	ctx = ensureQueryID(ctx)
 	if len(cols) == 0 || len(rows) == 0 {
 		return 0, nil
 	}
-	dialect := driverName(db)
-	if batchSize <= 0 {
-		batchSize = defaultBatchSizeFor(dialect, len(cols))
+	bs, err := batchSizeFor(string(rt.dialect), len(cols), batchSize)
+	if err != nil {
+		return 0, err
 	}
-	var total int64
-	for startIdx := 0; startIdx < len(rows); startIdx += batchSize {
-		end := startIdx + batchSize
-		if end > len(rows) {
-			end = len(rows)
+	var suffix string
+	if rt.dialect != sqlutil.SQLServer {
+		if suffix, err = buildUpsertSuffix(rt.dialect, cols, conflictCols, updateCols); err != nil {
+			return 0, err
 		}
-		chunk := rows[startIdx:end]
-
-		var sqlStr string
-		var args []any
-		var err error
-		if dialect == "sqlserver" {
-			sqlStr, args, err = buildMergeSQLServerWithOptions(table, cols, conflictCols, updateCols, chunk, opts)
-			if err != nil {
-				return total, err
-			}
-		} else {
-			sqlStr, args = buildInsertSQL(table, cols, chunk)
-			suffix, err2 := buildUpsertSuffix(dialect, conflictCols, updateCols)
-			if err2 != nil {
-				return total, err2
-			}
-			sqlStr += " " + suffix
+	}
+	stmts, err := buildBatches(len(rows), bs, func(s, e int) (string, []any, error) {
+		if rt.dialect == sqlutil.SQLServer {
+			return buildMergeSQLServerWithOptions(table, cols, conflictCols, updateCols, rows[s:e], opts)
 		}
-
-		var rowsAff int64
-		start := time.Now()
-		err = doWithPolicies(ctx, func() error {
-			res := db.WithContext(ctx).Exec(sqlStr, args...)
-			rowsAff = res.RowsAffected
-			return res.Error
-		})
-		logExec(ctx, "bulkupsert", sqlStr, args, start, err, rowsAff)
+		q, args, err := buildInsertSQL(rt.dialect, table, cols, rows[s:e])
 		if err != nil {
-			return total, err
+			return "", nil, err
 		}
-		total += rowsAff
+		return q + " " + suffix, args, nil
+	})
+	if err != nil {
+		return 0, err
 	}
-	return total, nil
+	return rt.execBatches(ensureQueryID(ctx), "bulkupsert", stmts)
 }
 
-// BulkUpdateByKey: anahtar sütununa göre toplu güncelleme (UPDATE ... WHERE keyCol IN (...))
+// BulkUpdateByKey: anahtar sütununa göre toplu güncelleme (UPDATE ... SET c = CASE ... WHERE keyCol IN (...)).
+// Batch boyutu satır başına gerçek parametre sayısından (2*len(updateCols)+1) hesaplanır.
 func BulkUpdateByKey(ctx context.Context, table string, keyCol string, updateCols []string, rows []map[string]any, batchSize int) (int64, error) {
-	db := DB()
-	if db == nil {
-		return 0, errors.New("db.Init çağrılmamış")
+	rt, err := current()
+	if err != nil {
+		return 0, err
 	}
-	ctx = ensureQueryID(ctx)
 	if len(rows) == 0 {
 		return 0, nil
 	}
-	dialect := driverName(db)
-	if batchSize <= 0 {
-		batchSize = defaultBatchSizeFor(dialect, len(rows[0]))
+	bs, err := batchSizeFor(string(rt.dialect), 2*len(updateCols)+1, batchSize)
+	if err != nil {
+		return 0, err
 	}
-	var total int64
-	for startIdx := 0; startIdx < len(rows); startIdx += batchSize {
-		end := startIdx + batchSize
-		if end > len(rows) {
-			end = len(rows)
-		}
-		chunk := rows[startIdx:end]
+	stmts, err := buildBatches(len(rows), bs, func(s, e int) (string, []any, error) {
+		return buildBulkUpdateByKeySQL(rt.dialect, table, keyCol, updateCols, rows[s:e])
+	})
+	if err != nil {
+		return 0, err
+	}
+	return rt.execBatches(ensureQueryID(ctx), "bulkupdate", stmts)
+}
 
-		sqlStr, args, err := buildBulkUpdateByKeySQL(dialect, table, keyCol, updateCols, chunk)
-		if err != nil {
-			return total, err
+type builtStmt struct {
+	sql  string
+	args []any
+}
+
+// buildBatches: tüm batch SQL'lerini veritabanına dokunmadan önce üretir
+// (doğrulama hataları hiçbir şey yazılmadan döner).
+func buildBatches(n, batchSize int, build func(start, end int) (string, []any, error)) ([]builtStmt, error) {
+	out := make([]builtStmt, 0, (n+batchSize-1)/batchSize)
+	for s := 0; s < n; s += batchSize {
+		e := s + batchSize
+		if e > n {
+			e = n
 		}
-		var rowsAff int64
+		q, args, err := build(s, e)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, builtStmt{q, args})
+	}
+	return out, nil
+}
+
+// execBatches: tek batch doğrudan, birden fazla batch tek transaction içinde çalışır.
+func (rt *runtime) execBatches(ctx context.Context, kind string, stmts []builtStmt) (int64, error) {
+	if len(stmts) == 1 {
+		var rows int64
 		start := time.Now()
-		err = doWithPolicies(ctx, func() error {
-			res := db.WithContext(ctx).Exec(sqlStr, args...)
-			rowsAff = res.RowsAffected
+		err := rt.doWithPolicies(ctx, opWrite, func() error {
+			res := rt.db.WithContext(ctx).Exec(stmts[0].sql, stmts[0].args...)
+			rows = res.RowsAffected
 			return res.Error
 		})
-		logExec(ctx, "bulkupdate", sqlStr, args, start, err, rowsAff)
-		if err != nil {
-			return total, err
-		}
-		total += rowsAff
+		rt.logExec(ctx, kind, stmts[0].sql, stmts[0].args, start, err, rows)
+		return rows, err
+	}
+	var total int64
+	err := rt.doWithPolicies(ctx, opTx, func() error {
+		total = 0
+		tctx := WithTxID(ctx, uuid.NewString())
+		return rt.db.WithContext(tctx).Transaction(func(tx *gorm.DB) error {
+			for _, st := range stmts {
+				start := time.Now()
+				res := tx.Exec(st.sql, st.args...)
+				rt.logExec(tctx, kind, st.sql, st.args, start, res.Error, res.RowsAffected)
+				if res.Error != nil {
+					return res.Error
+				}
+				total += res.RowsAffected
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return 0, err
 	}
 	return total, nil
 }
 
-func defaultBatchSizeFor(dialect string, colCount int) int {
-	if colCount <= 0 {
-		return 100
-	}
-	switch dialect {
-	case "sqlite":
-		maxRows := 999 / colCount
-		if maxRows <= 0 {
-			maxRows = 1
-		}
-		if maxRows > 300 {
-			maxRows = 300 // biraz daha agresif
-		}
-		return maxRows
-	case "postgres":
-		// PostgreSQL param limiti ~65535
-		maxRows := 65535 / colCount
-		if maxRows > 2000 {
-			maxRows = 2000
-		}
-		if maxRows <= 0 {
-			maxRows = 1
-		}
-		return maxRows
-	case "sqlserver":
-		// SQL Server param limiti ~2100
-		maxRows := 2000 / colCount
-		if maxRows > 500 {
-			maxRows = 500
-		}
-		if maxRows <= 0 {
-			maxRows = 1
-		}
-		return maxRows
-	case "mysql":
-		// Heuristik: küçük kolon setinde daha yüksek batch
-		if colCount <= 8 {
-			return 1000
-		}
-		if colCount <= 25 {
-			return 500
-		}
-		return 200
-	default:
-		if colCount >= 50 {
-			return 200
-		}
-		return 500
-	}
-}
-
-// ----- internal helpers (dialector/open/close & SQL builders) -----
+// ----- internal helpers (dialector/open/close) -----
 
 func openDB(cfg Config) (*gorm.DB, error) {
 	var dial gorm.Dialector
@@ -718,6 +617,9 @@ func openDB(cfg Config) (*gorm.DB, error) {
 }
 
 func closeDB(db *gorm.DB) error {
+	if db == nil {
+		return nil
+	}
 	sqlDB, err := db.DB()
 	if err != nil {
 		return err
@@ -733,6 +635,9 @@ func driverName(db *gorm.DB) string {
 }
 
 func loadSQL(fsys fs.FS, file string) (string, error) {
+	if !fs.ValidPath(file) {
+		return "", fmt.Errorf("db: geçersiz dosya yolu: %q", file)
+	}
 	b, err := fs.ReadFile(fsys, file)
 	if err != nil {
 		return "", err
@@ -740,180 +645,43 @@ func loadSQL(fsys fs.FS, file string) (string, error) {
 	return string(b), nil
 }
 
-// ${name} -> ? ve args üretir; slice/array ise "," ile ayrılmış çoklu ? oluşturur (boş slice => NULL). Eksik parametre hatası verir.
-func bindNamedToQ(sqlText string, params map[string]any) (string, []any, error) {
-	var out strings.Builder
-	args := make([]any, 0, 8)
-
-	for i := 0; i < len(sqlText); {
-		if i+2 < len(sqlText) && sqlText[i] == '$' && sqlText[i+1] == '{' {
-			j := i + 2
-			for j < len(sqlText) && sqlText[j] != '}' {
-				j++
-			}
-			if j >= len(sqlText) {
-				return "", nil, errors.New("parametre süslü parantez kapanmıyor")
-			}
-			name := sqlText[i+2 : j]
-			val, ok := params[name]
-			if !ok {
-				return "", nil, fmt.Errorf("eksik parametre: %s", name)
-			}
-			// slice/array genişletme
-			if val != nil {
-				v := reflect.ValueOf(val)
-				t := v.Type()
-				if t.Kind() == reflect.Slice || t.Kind() == reflect.Array {
-					// []byte özel durumu tek parametre
-					if t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8 {
-						out.WriteByte('?')
-						args = append(args, val)
-						i = j + 1
-						continue
-					}
-					n := v.Len()
-					if n == 0 {
-						out.WriteString("NULL")
-						i = j + 1
-						continue
-					}
-					for k := 0; k < n; k++ {
-						if k > 0 {
-							out.WriteString(",")
-						}
-						out.WriteByte('?')
-						args = append(args, v.Index(k).Interface())
-					}
-					i = j + 1
-					continue
-				}
-			}
-			out.WriteByte('?')
-			args = append(args, val)
-			i = j + 1
-			continue
-		}
-		out.WriteByte(sqlText[i])
-		i++
-	}
-	return out.String(), args, nil
-}
-
-// MERGE tabanlı upsert (sqlserver) + opsiyonlar
-func buildMergeSQLServerWithOptions(table string, cols []string, keyCols []string, updateCols []string, rows [][]any, opts *UpsertOptions) (string, []any, error) {
-	if len(cols) == 0 || len(rows) == 0 {
-		return "", nil, nil
-	}
-	if len(keyCols) == 0 {
-		return "", nil, errors.New("sqlserver MERGE için keyCols gerekli")
-	}
-	var b strings.Builder
-	b.WriteString("MERGE INTO ")
-	b.WriteString(table)
-	if opts != nil && strings.TrimSpace(opts.SQLServerTableHint) != "" {
-		b.WriteString(" ")
-		b.WriteString(strings.TrimSpace(opts.SQLServerTableHint))
-	}
-	b.WriteString(" AS target USING (VALUES ")
-	args := make([]any, 0, len(rows)*len(cols))
-	for i, r := range rows {
-		if i > 0 {
-			b.WriteString(",")
-		}
-		b.WriteString("(")
-		for j := range cols {
-			if j > 0 {
-				b.WriteString(",")
-			}
-			b.WriteString("?")
-			args = append(args, r[j])
-		}
-		b.WriteString(")")
-	}
-	b.WriteString(") AS src (")
-	for i, c := range cols {
-		if i > 0 {
-			b.WriteString(",")
-		}
-		b.WriteString(c)
-	}
-	b.WriteString(") ON (")
-	for i, k := range keyCols {
-		if i > 0 {
-			b.WriteString(" AND ")
-		}
-		b.WriteString("target.")
-		b.WriteString(k)
-		b.WriteString(" = src.")
-		b.WriteString(k)
-	}
-	b.WriteString(") ")
-	if len(updateCols) > 0 {
-		b.WriteString("WHEN MATCHED THEN UPDATE SET ")
-		for i, c := range updateCols {
-			if i > 0 {
-				b.WriteString(",")
-			}
-			b.WriteString("target.")
-			b.WriteString(c)
-			b.WriteString(" = src.")
-			b.WriteString(c)
-		}
-		b.WriteString(" ")
-	}
-	b.WriteString("WHEN NOT MATCHED THEN INSERT (")
-	for i, c := range cols {
-		if i > 0 {
-			b.WriteString(",")
-		}
-		b.WriteString(c)
-	}
-	b.WriteString(") VALUES (")
-	for i, c := range cols {
-		_ = c
-		if i > 0 {
-			b.WriteString(",")
-		}
-		b.WriteString("src.")
-		b.WriteString(cols[i])
-	}
-	b.WriteString(") ")
-	// OUTPUT
-	if opts != nil {
-		if out := opts.Output; out != nil {
-			clause := out.render()
-			if clause != "" {
-				b.WriteString(clause)
-				b.WriteString(" ")
-			}
-		} else if s := strings.TrimSpace(opts.SQLServerOutput); s != "" {
-			b.WriteString(s)
-			b.WriteString(" ")
-		}
-	}
-	b.WriteString(";")
-	return b.String(), args, nil
-}
+// placeholder: *sql.Stmt ile doğrudan kullanım için sürücü yer tutucusu.
+func (rt *runtime) placeholder(n int) string { return sqlutil.Placeholder(rt.dialect, n) }
 
 // --- logging & retry/breaker helpers ---
-func doWithPolicies(ctx context.Context, fn func() error) error {
-	if cb == nil {
-		return doWithRetry(ctx, fn)
+
+type opKind int
+
+const (
+	opRead opKind = iota
+	opWrite
+	opTx
+)
+
+func (rt *runtime) writeRetryAllowed(ctx context.Context) bool {
+	if v, ok := ctx.Value(ctxKeyWriteRetry).(bool); ok {
+		return v
 	}
-	return cb.Execute(ctx, func() error { return doWithRetry(ctx, fn) })
+	return rt.cfg.RetryWrites
 }
 
-func doWithRetry(ctx context.Context, fn func() error) error {
-	attempts := defaultCfg.RetryAttempts
-	if attempts <= 1 {
-		return fn()
+func (rt *runtime) doWithPolicies(ctx context.Context, kind opKind, fn func() error) error {
+	retry := func() error {
+		attempts := rt.cfg.RetryAttempts
+		if attempts <= 1 || (kind != opRead && !rt.writeRetryAllowed(ctx)) {
+			attempts = 1
+		}
+		return resilience.RetryIf(ctx, attempts, rt.cfg.RetryDelay, shouldRetry(kind == opRead), fn)
 	}
-	delay := defaultCfg.RetryDelay
-	return resilience.Retry(ctx, attempts, delay, fn)
+	if rt.cb == nil {
+		return retry()
+	}
+	return rt.cb.Execute(ctx, retry)
 }
 
-func logExec(ctx context.Context, kind string, sqlText string, args []any, start time.Time, err error, affected int64) {
-	if !defaultCfg.EnableLogging {
+func (rt *runtime) logExec(ctx context.Context, kind string, sqlText string, args []any, start time.Time, err error, affected int64) {
+	cfg := rt.cfg
+	if !cfg.EnableLogging {
 		return
 	}
 	elapsed := time.Since(start)
@@ -932,18 +700,17 @@ func logExec(ctx context.Context, kind string, sqlText string, args []any, start
 	if qid, ok := QueryIDFromCtx(ctx); ok && qid != "" {
 		attrs = append(attrs, "query_id", qid)
 	}
-	if defaultCfg.ConnLabel != "" {
-		attrs = append(attrs, "conn", defaultCfg.ConnLabel)
+	if cfg.ConnLabel != "" {
+		attrs = append(attrs, "conn", cfg.ConnLabel)
 	}
-	if defaultCfg.DatabaseName != "" {
-		attrs = append(attrs, "db", defaultCfg.DatabaseName)
+	if cfg.DatabaseName != "" {
+		attrs = append(attrs, "db", cfg.DatabaseName)
 	}
-	if defaultCfg.SlowThreshold > 0 && elapsed > defaultCfg.SlowThreshold {
+	if cfg.SlowThreshold > 0 && elapsed > cfg.SlowThreshold {
 		attrs = append(attrs, "slow", true)
 	}
-	if defaultCfg.EnableStmtCache {
-		prepares, hits := StmtMetrics()
-		attrs = append(attrs, "prep", prepares, "hit", hits)
+	if rt.cache != nil {
+		attrs = append(attrs, "prep", rt.cache.prepares.Load(), "hit", rt.cache.hits.Load())
 	}
 	if err != nil {
 		logger.Error("db.exec", append(attrs, "err", err.Error())...)
@@ -952,153 +719,20 @@ func logExec(ctx context.Context, kind string, sqlText string, args []any, start
 	logger.Info("db.exec", attrs...)
 }
 
-// --- SQL builder helpers ---
-
-func buildInsertSQL(table string, cols []string, rows [][]any) (string, []any) {
-	var b strings.Builder
-	b.WriteString("INSERT INTO ")
-	b.WriteString(table)
-	b.WriteString(" (")
-	for i, c := range cols {
-		if i > 0 {
-			b.WriteString(",")
-		}
-		b.WriteString(c)
-	}
-	b.WriteString(") VALUES ")
-	args := make([]any, 0, len(rows)*len(cols))
-	for i, r := range rows {
-		if i > 0 {
-			b.WriteString(",")
-		}
-		b.WriteString("(")
-		for j := range cols {
-			if j > 0 {
-				b.WriteString(",")
-			}
-			b.WriteString("?")
-			args = append(args, r[j])
-		}
-		b.WriteString(")")
-	}
-	return b.String(), args
-}
-
-func buildUpsertSuffix(dialect string, conflictCols []string, updateCols []string) (string, error) {
-	if len(updateCols) == 0 {
-		return "", nil
-	}
-	switch dialect {
-	case "postgres", "sqlite":
-		if len(conflictCols) == 0 {
-			return "", errors.New("postgres/sqlite için conflictCols gerekli")
-		}
-		var b strings.Builder
-		b.WriteString("ON CONFLICT (")
-		for i, c := range conflictCols {
-			if i > 0 {
-				b.WriteString(",")
-			}
-			b.WriteString(c)
-		}
-		b.WriteString(") DO UPDATE SET ")
-		for i, c := range updateCols {
-			if i > 0 {
-				b.WriteString(",")
-			}
-			b.WriteString(c)
-			b.WriteString(" = EXCLUDED.")
-			b.WriteString(c)
-		}
-		return b.String(), nil
-	case "mysql":
-		var b strings.Builder
-		b.WriteString("ON DUPLICATE KEY UPDATE ")
-		for i, c := range updateCols {
-			if i > 0 {
-				b.WriteString(",")
-			}
-			b.WriteString(c)
-			b.WriteString(" = VALUES(")
-			b.WriteString(c)
-			b.WriteString(")")
-		}
-		return b.String(), nil
-	case "sqlserver":
-		return "", errors.New("sqlserver için upsert desteklenmiyor (MERGE kullanın)")
-	default:
-		return "", fmt.Errorf("bilinmeyen dialector: %s", dialect)
-	}
-}
-
-func buildBulkUpdateByKeySQL(dialect, table, keyCol string, updateCols []string, rows []map[string]any) (string, []any, error) {
-	if len(rows) == 0 {
-		return "", nil, nil
-	}
-	var b strings.Builder
-	b.WriteString("UPDATE ")
-	b.WriteString(table)
-	b.WriteString(" SET ")
-	args := make([]any, 0, len(rows)*(len(updateCols)*2+1))
-	for i, c := range updateCols {
-		if i > 0 {
-			b.WriteString(",")
-		}
-		b.WriteString(c)
-		b.WriteString(" = CASE ")
-		for _, r := range rows {
-			key, ok := r[keyCol]
-			if !ok {
-				return "", nil, fmt.Errorf("row'da key eksik: %s", keyCol)
-			}
-			val, ok := r[c]
-			if !ok {
-				return "", nil, fmt.Errorf("row'da kolon eksik: %s", c)
-			}
-			b.WriteString("WHEN ")
-			b.WriteString(keyCol)
-			b.WriteString(" = ? THEN ? ")
-			args = append(args, key, val)
-		}
-		b.WriteString("ELSE ")
-		b.WriteString(table)
-		b.WriteString(".")
-		b.WriteString(c)
-		b.WriteString(" END")
-	}
-	b.WriteString(" WHERE ")
-	b.WriteString(keyCol)
-	b.WriteString(" IN (")
-	for i := range rows {
-		if i > 0 {
-			b.WriteString(",")
-		}
-		b.WriteString("?")
-	}
-	b.WriteString(")")
-	for _, r := range rows {
-		args = append(args, r[keyCol])
-	}
-	return b.String(), args, nil
-}
-
-// buildMergeSQLServer: WithOptions sarmalayıcısı (opts=nil)
-func buildMergeSQLServer(table string, cols []string, keyCols []string, updateCols []string, rows [][]any) (string, []any, error) {
-	return buildMergeSQLServerWithOptions(table, cols, keyCols, updateCols, rows, nil)
-}
-
 // Tx: context tabanlı transaction wrapper. fn başarılı dönerse commit, hata dönerse rollback.
-// Not: Retry/policy devrede olduğundan, fn idempotent olmalıdır veya deadlock gibi durumlar için güvenle tekrar çalıştırılabilir olmalıdır.
+// Transaction varsayılan olarak yeniden DENENMEZ; Config.RetryWrites veya
+// WithWriteRetry(ctx, true) ile açılırsa yalnızca geçici hatalarda tüm fn
+// yeniden çalışır (fn idempotent olmalıdır).
 func Tx(ctx context.Context, fn func(ctx context.Context, tx *gorm.DB) error) error {
-	db := DB()
-	if db == nil {
-		return errors.New("db.Init çağrılmamış")
+	rt, err := current()
+	if err != nil {
+		return err
 	}
 	ctx = ensureQueryID(ctx)
-	return doWithPolicies(ctx, func() error {
+	return rt.doWithPolicies(ctx, opTx, func() error {
 		// Her transaction'a benzersiz tx_id verelim (log korelasyonu için)
 		tctx := WithTxID(ctx, uuid.NewString())
-		return db.WithContext(tctx).Transaction(func(tx *gorm.DB) error {
+		return rt.db.WithContext(tctx).Transaction(func(tx *gorm.DB) error {
 			return fn(tctx, tx)
 		})
 	})
@@ -1106,9 +740,8 @@ func Tx(ctx context.Context, fn func(ctx context.Context, tx *gorm.DB) error) er
 
 // ExecReturningSQL: dosyadan yüklenen RETURNING/OUTPUT içeren DML'in dönen satırlarını dest'e yazar.
 func ExecReturningSQL[T any](ctx context.Context, fsys fs.FS, file string, params map[string]any, dest *[]T) error {
-	db := DB()
-	if db == nil {
-		return errors.New("db.Init çağrılmamış")
+	if _, err := current(); err != nil {
+		return err
 	}
 	raw, err := loadSQL(fsys, file)
 	if err != nil {
@@ -1118,10 +751,14 @@ func ExecReturningSQL[T any](ctx context.Context, fsys fs.FS, file string, param
 }
 
 // ExecReturningString: metin SQL (RETURNING/OUTPUT içeren) çalıştırır ve dönen satırları dest'e yazar.
+// Yazma işlemi sayılır: varsayılan olarak yeniden denenmez.
 func ExecReturningString[T any](ctx context.Context, sqlText string, params map[string]any, dest *[]T) error {
-	db := DB()
-	if db == nil {
-		return errors.New("db.Init çağrılmamış")
+	if dest == nil {
+		return errors.New("db: dest nil olamaz")
+	}
+	rt, err := current()
+	if err != nil {
+		return err
 	}
 	ctx = ensureQueryID(ctx)
 	bound, args, err := bindNamedToQ(sqlText, params)
@@ -1129,11 +766,10 @@ func ExecReturningString[T any](ctx context.Context, sqlText string, params map[
 		return err
 	}
 	start := time.Now()
-	var qerr error
-	err = doWithPolicies(ctx, func() error {
-		qerr = db.WithContext(ctx).Raw(bound, args...).Scan(dest).Error
-		return qerr
+	err = rt.doWithPolicies(ctx, opWrite, func() error {
+		*dest = (*dest)[:0]
+		return rt.db.WithContext(ctx).Raw(bound, args...).Scan(dest).Error
 	})
-	logExec(ctx, "exec_return", bound, args, start, err, int64(len(*dest)))
+	rt.logExec(ctx, "exec_return", bound, args, start, err, int64(len(*dest)))
 	return err
 }

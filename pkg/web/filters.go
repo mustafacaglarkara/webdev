@@ -8,16 +8,18 @@ import (
 	"time"
 	"unicode/utf8"
 
-	// sanitize için
-	"github.com/microcosm-cc/bluemonday"
+	"github.com/mustafacaglarkara/webdev/pkg/security"
 )
 
-// JetTemplateFilters returns a FuncMap-compatible map of common template filters.
-// Intended to be used with Jet or html/template.
+// JetTemplateFilters, Jet veya html/template ile kullanılabilen ortak filtreleri döner.
+//
+// safe ve sanitize html/template.HTML döner: html/template bunu kaçışsız basar. Jet ise
+// template.HTML'i güvenli saymaz ve yine kaçış uygular; Jet'te çıktıyı raw'a
+// aktarın (A5-5):
+//
+//	{{ sanitize(UntrustedHTML) | raw }}
+//	{{ safe(TrustedHTML) | raw }}
 func JetTemplateFilters() map[string]interface{} {
-	// hazır politikalar
-	strict := bluemonday.StrictPolicy()
-	relaxed := bluemonday.UGCPolicy()
 	return map[string]interface{}{
 		"upper": func(s string) string { return strings.ToUpper(s) },
 		"default": func(val any, def any) any {
@@ -69,19 +71,18 @@ func JetTemplateFilters() map[string]interface{} {
 				return fmt.Sprint(t)
 			}
 		},
+		// safe: KAÇIŞ YAPMAZ. Yalnızca güvenilir (kendi ürettiğiniz) HTML için kullanın;
+		// kullanıcı girdisi için sanitize kullanın. Jet'te `| raw` gerekir.
 		"safe": func(s string) template.HTML { return template.HTML(s) },
-		// sanitize(input, mode?) — mode: "relaxed" (default), "strict"
+		// sanitize(input, mode?) — mode: "relaxed"/"ugc" (varsayılan), "strict".
+		// Bilinmeyen mod strict uygular. Temizleme pkg/security'deki tek politikayla yapılır.
+		// Jet'te `| raw` gerekir.
 		"sanitize": func(s string, mode ...string) template.HTML {
-			m := "relaxed"
+			m := ""
 			if len(mode) > 0 {
-				m = strings.ToLower(strings.TrimSpace(mode[0]))
+				m = mode[0]
 			}
-			switch m {
-			case "strict":
-				return template.HTML(strict.Sanitize(s))
-			default:
-				return template.HTML(relaxed.Sanitize(s))
-			}
+			return template.HTML(security.SanitizeHTMLMode(s, m))
 		},
 	}
 }

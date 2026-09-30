@@ -1,0 +1,13 @@
+{
+  "admin.title": "Admin dashboard",
+  "admin.intro": "This page is protected twice: a role check (admin) and a casbin policy.",
+  "admin.users_title": "Demo users",
+  "admin.col_username": "Username",
+  "admin.col_name": "Name",
+  "admin.col_role": "Role",
+  "admin.policies_title": "Casbin policies",
+  "admin.policies_note": "Policies were last loaded at {{.Time}}.",
+  "admin.col_subject": "Subject",
+  "admin.col_object": "Object",
+  "admin.col_action": "Action"
+}

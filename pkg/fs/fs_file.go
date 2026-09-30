@@ -11,6 +11,9 @@ import (
 	"github.com/gabriel-vasile/mimetype"
 )
 
+// ErrSameFile CopyFile kaynağı ve hedefi aynı dosyayı gösterdiğinde döner.
+var ErrSameFile = errors.New("fs: source and destination are the same file")
+
 func FileExists(path string) bool { _, err := os.Stat(path); return err == nil }
 func DirExists(path string) bool  { fi, err := os.Stat(path); return err == nil && fi.IsDir() }
 func EnsureDir(path string) error {
@@ -26,12 +29,26 @@ func WriteFileString(path, data string) error {
 	}
 	return os.WriteFile(path, []byte(data), 0o644)
 }
-func CopyFile(src, dst string) error {
+
+// CopyFile src dosyasını dst'ye kopyalar. Kaynak ve hedef aynı dosyaysa
+// (aynı yol, hard link veya symlink üzerinden) ErrSameFile döner ve dosyaya
+// dokunulmaz. Hedef dosyanın Close hatası döndürülür.
+func CopyFile(src, dst string) (err error) {
 	srcF, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer srcF.Close()
+	srcInfo, err := srcF.Stat()
+	if err != nil {
+		return err
+	}
+	if !srcInfo.Mode().IsRegular() {
+		return errors.New("fs: source is not a regular file")
+	}
+	if dstInfo, err := os.Stat(dst); err == nil && os.SameFile(srcInfo, dstInfo) {
+		return ErrSameFile
+	}
 	if err := EnsureDir(filepath.Dir(dst)); err != nil {
 		return err
 	}
@@ -39,7 +56,11 @@ func CopyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer dstF.Close()
+	defer func() {
+		if cerr := dstF.Close(); err == nil {
+			err = cerr
+		}
+	}()
 	_, err = io.Copy(dstF, srcF)
 	return err
 }
@@ -58,12 +79,12 @@ func ListDirFiles(path string) ([]string, error) {
 	return out, nil
 }
 func Walk(root string, fn func(path string, d iiofs.DirEntry) error) error {
+	if fn == nil {
+		return errors.New("nil walk func")
+	}
 	return filepath.WalkDir(root, func(p string, d iiofs.DirEntry, err error) error {
 		if err != nil {
 			return err
-		}
-		if fn == nil {
-			return errors.New("nil walk func")
 		}
 		return fn(p, d)
 	})

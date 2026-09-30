@@ -1,0 +1,25 @@
+<section>
+  <h1>{{ t(ctx, "demo_menu.title") }}</h1>
+  <p>{{ t(ctx, "demo_menu.intro", dict("Role", Role, "Count", RecordCount)) }}</p>
+  <table class="grid">
+    <thead>
+      <tr>
+        <th>{{ t(ctx, "demo_menu.col_label") }}</th>
+        <th>{{ t(ctx, "demo_menu.col_url") }}</th>
+        <th>{{ t(ctx, "demo_menu.col_perm") }}</th>
+        <th>{{ t(ctx, "demo_menu.col_active") }}</th>
+      </tr>
+    </thead>
+    <tbody>
+    {{- range _, row := Rows }}
+      <tr class="{{ if row.Item.Active }}active{{ end }}">
+        <td class="depth-{{ row.Depth }}">{{ t(ctx, row.Item.LabelKey) }} <small class="muted">({{ row.Item.LabelKey }})</small></td>
+        <td>{{ if row.Item.URL != "" }}<code>{{ row.Item.URL }}</code>{{ else }}—{{ end }}</td>
+        <td>{{ if row.Item.Object != "" }}<code>{{ row.Item.Action }} {{ row.Item.Object }}</code>{{ else }}{{ t(ctx, "demo_menu.public") }}{{ end }}</td>
+        <td>{{ if row.Item.Active }}{{ t(ctx, "demo_menu.yes") }}{{ else }}{{ t(ctx, "demo_menu.no") }}{{ end }}</td>
+      </tr>
+    {{- end }}
+    </tbody>
+  </table>
+  <p class="muted">{{ t(ctx, "demo_menu.hidden_note", dict("Count", HiddenCount)) }}</p>
+</section>

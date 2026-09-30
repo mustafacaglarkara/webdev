@@ -1,50 +1,54 @@
-l# ratelimit
+# ratelimit
 
-Token bucket tabanlı basit bir rate limiter. E-posta gönderimi, harici API çağrıları gibi işlemleri belirli bir hızda sınırlandırmak için kullanılabilir.
+Token bucket tabanlı, eşzamanlı kullanıma güvenli rate limiter.
 
-## Özellikler
-- Token bucket algoritması (burst desteği)
-- Context ile bekleme/iptal desteği (Wait, Do)
-- Hızlı karar (Allow)
-
-## Kurulum
-Bu paket projedeki `pkg/ratelimit` altında yer alır. Doğrudan import ederek kullanabilirsiniz.
+```go
+import "github.com/mustafacaglarkara/webdev/pkg/ratelimit"
+```
 
 ## Kullanım
 
-### Basit Kullanım (Allow)
 ```go
-lim, _ := ratelimit.NewLimiter(30, time.Minute, 10) // dakikada 30, burst 10
+lim, err := ratelimit.NewLimiter(30, time.Minute, 10) // dakikada 30, anlık 10'a kadar
+if err != nil {
+    return err
+}
+defer lim.Close()
+
+// Beklemeden karar
 if lim.Allow() {
     // işlem yapılabilir
 }
-```
 
-### Context ile Bekleme (Wait)
-```go
-ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-defer cancel()
+// Token gelene kadar bekle (ctx ile iptal edilebilir)
 if err := lim.Wait(ctx); err != nil {
-    // zaman aşımı/iptal
-    return err
+    return err // ctx.Err() veya ratelimit.ErrClosed
 }
-// token alındı, işlemi yap
+
+// Bekle ve çalıştır
+err = lim.Do(ctx, func() error { return sendMail() })
 ```
 
-### İşlemi Sarmalayarak (Do)
-```go
-_ = lim.Do(ctx, func() error {
-    // sınırlandırılmış iş
-    return sendEmail()
-})
-```
+## Davranış
 
-### Hız Planlama
-- rate=60, per=1m, burst=5 => ortalama saniyede 1 istek, en fazla 5 anlık patlama
-- rate=300, per=1m, burst=20 => ortalama saniyede 5 istek, en fazla 20 anlık patlama
+- Hız `rate / perInterval`'dır; token'lar geçen süreye göre kesirli olarak
+  doldurulur. Arka plan goroutine'i veya tick yoktur; bu nedenle çok yüksek
+  hızlarda (ör. saniyede 1.000.000) yuvarlama veya 1 ms tick sınırı yüzünden hız bozulmaz.
+- Kova dolu başlar; kapasite `burst`'tür (`burst <= 0` ise 1).
+- `Wait` polling yapmaz; bir sonraki token'ın dolacağı ana kadar uyur.
+- `rate <= 0` veya `perInterval <= 0` hata döner.
 
-## İpuçları
-- E-posta gönderiminde SMTP limitlerine uymak için idealdir.
-- Harici API çağrılarında 429 veya throttling hatalarını önlemeye yardımcı olur.
-- İş bittiğinde `lim.Close()` çağırarak goroutine’i sonlandırabilirsiniz.
+## Close
 
+`Close` limiter'ı kapatır:
+
+- Sonrasında `Allow` false, `Wait`/`Do` `ErrClosed` döner.
+- `Wait` içinde bekleyen çağrılar hemen uyandırılır ve `ErrClosed` alır.
+- Birden fazla kez çağrılabilir.
+- Arka plan goroutine'i olmadığından `Close` çağrılmaması sızıntıya yol açmaz;
+  ancak kapanışta bekleyenleri serbest bırakmak için çağrılması önerilir.
+
+## Güvenlik notları
+
+- Limiter süreç içidir (in-memory); birden çok örnek/sunucu arasında paylaşılmaz.
+  Dağıtık sınırlama için merkezi bir depo (Redis vb.) gerekir.

@@ -1,0 +1,21 @@
+<section>
+  <h1>{{ t(ctx, "about.title") }}</h1>
+  <p>{{ t(ctx, "about.body") }}</p>
+
+  <h2>{{ t(ctx, "about.packages_title") }}</h2>
+  <table class="grid">
+    <thead><tr><th>{{ t(ctx, "about.col_package") }}</th><th>{{ t(ctx, "about.col_usage") }}</th></tr></thead>
+    <tbody>
+    {{- range _, p := Packages }}
+      <tr><td><code>{{ p.Path }}</code></td><td>{{ p.Usage }}</td></tr>
+    {{- end }}
+    </tbody>
+  </table>
+
+  <h2>{{ t(ctx, "about.sanitize_title") }}</h2>
+  <p>{{ t(ctx, "about.sanitize_note") }}</p>
+  <pre class="code">{{ UntrustedHTML }}</pre>
+  {* Bilinçli istisna: içerik pkg/security politikasıyla temizlendikten sonra kaçışsız basılır. *}
+  <div class="sanitized">{{ sanitize(UntrustedHTML) | raw }}</div>
+  <p class="muted">{{ t(ctx, "about.slug_example", dict("Input", SlugInput, "Slug", SlugOutput)) }}</p>
+</section>

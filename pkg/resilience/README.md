@@ -1,90 +1,80 @@
 # resilience
 
-Dayanıklılık (resilience) ile ilgili yardımcı fonksiyonlar içerir. Retry, circuit breaker gibi desenler için kullanılır.
-
-## Fonksiyonlar ve Detaylı Kullanım Örnekleri
-
-### Retry
-Belirtilen sayıda deneme ve gecikme ile bir işlemi tekrarlar. İşlem başarılı olursa hemen döner, başarısız olursa tekrar dener. Context ile iptal edilebilir.
+Yeniden deneme (retry) ve devre kesici (circuit breaker) desenleri.
 
 ```go
-package main
-import (
-    "context"
-    "errors"
-    "fmt"
-    "time"
-    "your/module/path/pkg/resilience"
-)
-
-func main() {
-    ctx := context.Background()
-    deneme := 0
-    err := resilience.Retry(ctx, 3, time.Second, func() error {
-        deneme++
-        if deneme < 3 {
-            fmt.Println("Deneme:", deneme)
-            return errors.New("hata")
-        }
-        fmt.Println("Başarılı deneme:", deneme)
-        return nil
-    })
-    if err != nil {
-        fmt.Println("Tüm denemeler başarısız:", err)
-    }
-}
+import "github.com/mustafacaglarkara/webdev/pkg/resilience"
 ```
 
-Çıktı:
-```
-Deneme: 1
-Deneme: 2
-Başarılı deneme: 3
-```
-
-### Circuit Breaker
-Belirli sayıda hata sonrası işlemleri geçici olarak engeller (açık duruma geçer). Süre dolunca tekrar denemeye izin verir.
+## Retry
 
 ```go
-package main
-import (
-    "context"
-    "errors"
-    "fmt"
-    "time"
-    "your/module/path/pkg/resilience"
-)
+err := resilience.Retry(ctx, 3, 100*time.Millisecond, func() error {
+	return callService()
+})
+```
 
-func main() {
-    cb := resilience.NewCircuitBreaker(2, 5*time.Second) // 2 hata sonrası 5 sn açık kalır
-    for i := 1; i <= 5; i++ {
-        err := cb.Execute(context.Background(), func() error {
-            if i < 3 {
-                return errors.New("hata")
-            }
-            return nil
-        })
-        if err != nil {
-            fmt.Printf("%d. çağrı hata: %v\n", i, err)
-        } else {
-            fmt.Printf("%d. çağrı başarılı\n", i)
-        }
-        time.Sleep(1 * time.Second)
-    }
+Kurallar:
+
+- `attempts <= 0` ise fonksiyon **bir kez** çalışır.
+- Son denemeden sonra beklenmez.
+- `context.Canceled` / `context.DeadlineExceeded` döndüren fonksiyon yeniden denenmez.
+- Context ilk denemeden önce bitmişse fonksiyon çağrılmaz, `ctx.Err()` döner.
+- Context bekleme sırasında biterse `errors.Join(ctx.Err(), sonHata)` döner; `errors.Is`
+  her ikisi için de çalışır:
+
+```go
+err := resilience.Retry(ctx, 10, time.Second, fn)
+if errors.Is(err, context.DeadlineExceeded) && errors.Is(err, ErrUpstream) { /* ... */ }
+```
+
+### Hata filtresi: RetryIf
+
+```go
+err := resilience.RetryIf(ctx, 5, 50*time.Millisecond,
+	func(err error) bool { return errors.Is(err, ErrTemporary) }, // yalnızca bunları dene
+	fn)
+```
+
+### Üstel backoff: RetryPolicy
+
+```go
+p := resilience.RetryPolicy{
+	Attempts:    5,
+	Delay:       50 * time.Millisecond,
+	Multiplier:  2,               // 50ms, 100ms, 200ms, ...
+	MaxDelay:    time.Second,
+	ShouldRetry: nil,             // nil => resilience.DefaultShouldRetry
 }
+err := p.Do(ctx, fn)
 ```
 
-Çıktı örneği:
-```
-1. çağrı hata: hata
-2. çağrı hata: hata
-3. çağrı hata: circuit breaker is open
-4. çağrı hata: circuit breaker is open
-5. çağrı başarılı
+`DefaultShouldRetry` context hataları dışındaki her hatayı yeniden dener;
+`IsContextError(err)` yardımcı fonksiyonu da dışa açıktır.
+
+## Circuit Breaker
+
+```go
+cb := resilience.NewCircuitBreaker(5, 30*time.Second) // 5 ardışık hata => 30 sn açık
+err := cb.Execute(ctx, func() error { return callService() })
+if errors.Is(err, resilience.ErrBreakerOpen) {
+	// hızlı başarısızlık
+}
+fmt.Println(cb.State()) // "closed" | "open" | "half-open"
 ```
 
-## Notlar
-- Retry fonksiyonu context ile iptal edilebilir, iptal edilirse context.Err() döner.
-- CircuitBreaker, threshold kadar hata sonrası belirli süre işlemleri engeller, sonra tekrar dener.
-- Her iki fonksiyon da thread-safe çalışır.
-- Daha fazla detay için kodu inceleyebilirsiniz.
+- Açık süre dolunca devre **yarı-açık** olur ve yalnızca **tek** prob çağrısına izin verilir;
+  prob başarılıysa kapanır, başarısızsa yeniden açılır.
+- `ctx` zaten bitmişse fonksiyon çağrılmaz; context hataları başarısızlık sayılmaz.
+- Fonksiyon panik atarsa çağrı başarısızlık sayılır, prob hakkı serbest kalır ve panik
+  yeniden fırlatılır (devre kilitlenmez).
+- Hangi hataların başarısızlık sayılacağı seçilebilir:
+
+```go
+cb := resilience.NewCircuitBreaker(5, 30*time.Second,
+	resilience.WithFailurePredicate(func(err error) bool {
+		return !errors.Is(err, sql.ErrNoRows) // "bulunamadı" altyapı hatası değildir
+	}))
+```
+
+Tüm tipler eşzamanlı kullanım için güvenlidir.

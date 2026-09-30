@@ -1,0 +1,37 @@
+<section class="narrow">
+  <h1>{{ t(ctx, "formdemo.title") }}</h1>
+  <p>{{ t(ctx, "formdemo.intro") }}</p>
+  <form method="post" action="{{ route("formdemo.submit") }}" class="form" novalidate>
+    <input type="hidden" name="csrf_token" value="{{ CSRFToken }}">
+
+    <label for="name">{{ t(ctx, "formdemo.name") }}</label>
+    <input id="name" name="name" value="{{ old(ctx, "name") }}" class="{{ if form_has_error(Form, "name") }}invalid{{ end }}">
+    {{- if form_has_error(Form, "name") }}<p class="error">{{ form_error(Form, "name") }}</p>{{ end }}
+
+    <label for="email">{{ t(ctx, "formdemo.email") }}</label>
+    <input id="email" name="email" type="email" value="{{ old(ctx, "email") }}" class="{{ if form_has_error(Form, "email") }}invalid{{ end }}">
+    {{- if form_has_error(Form, "email") }}<p class="error">{{ form_error(Form, "email") }}</p>{{ end }}
+
+    <label for="age">{{ t(ctx, "formdemo.age") }}</label>
+    <input id="age" name="age" inputmode="numeric" value="{{ old(ctx, "age") }}" class="{{ if form_has_error(Form, "age") }}invalid{{ end }}">
+    {{- if form_has_error(Form, "age") }}<p class="error">{{ form_error(Form, "age") }}</p>{{ end }}
+
+    <label for="topic">{{ t(ctx, "formdemo.topic") }}</label>
+    <select id="topic" name="topic" class="{{ if form_has_error(Form, "topic") }}invalid{{ end }}">
+      <option value="">—</option>
+      <option value="sales"{{ if old(ctx, "topic") == "sales" }} selected{{ end }}>{{ t(ctx, "formdemo.topic_sales") }}</option>
+      <option value="support"{{ if old(ctx, "topic") == "support" }} selected{{ end }}>{{ t(ctx, "formdemo.topic_support") }}</option>
+      <option value="other"{{ if old(ctx, "topic") == "other" }} selected{{ end }}>{{ t(ctx, "formdemo.topic_other") }}</option>
+    </select>
+    {{- if form_has_error(Form, "topic") }}<p class="error">{{ form_error(Form, "topic") }}</p>{{ end }}
+
+    <label for="message">{{ t(ctx, "formdemo.message") }}</label>
+    <textarea id="message" name="message" rows="4" class="{{ if form_has_error(Form, "message") }}invalid{{ end }}">{{ old(ctx, "message") }}</textarea>
+    {{- if form_has_error(Form, "message") }}<p class="error">{{ form_error(Form, "message") }}</p>{{ end }}
+
+    <label class="check"><input type="checkbox" name="agree" value="1"{{ if old(ctx, "agree") == "1" }} checked{{ end }}> {{ t(ctx, "formdemo.agree") }}</label>
+    {{- if form_has_error(Form, "agree") }}<p class="error">{{ form_error(Form, "agree") }}</p>{{ end }}
+
+    <button type="submit">{{ t(ctx, "formdemo.submit") }}</button>
+  </form>
+</section>

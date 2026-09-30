@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # pkg/fs RAR/7z testleri araçlar yoksa atlanır; CI'da kurulur (V5-2).
+      - name: Arşiv araçları (7z, unrar)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full unrar
+
+      # go-sqlite3 ve chai2010/webp cgo gerektirir
+      - name: Build
+        run: go build ./...
+        env:
+          CGO_ENABLED: "1"
+
+      - name: go.mod düzenli mi
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: gofmt
+        run: |
+          out="$(gofmt -l cmd pkg)"
+          if [ -n "$out" ]; then echo "$out"; exit 1; fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+        env:
+          CGO_ENABLED: "1"
+
+  # Gerçek PostgreSQL / MySQL / SQL Server sunucularına karşı uçtan uca testler (V5-1).
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: webdev
+          POSTGRES_PASSWORD: webdev
+          POSTGRES_DB: webdev
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U webdev"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: webdev
+          MYSQL_DATABASE: webdev
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -pwebdev --silent"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: "Webdev!Passw0rd"
+          MSSQL_PID: Express
+        ports: ["1433:1433"]
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'Webdev!Passw0rd' -Q 'SELECT 1' || exit 1"
+          --health-interval 10s --health-timeout 10s --health-retries 30 --health-start-period 30s
+    env:
+      WEBDEV_IT_POSTGRES_DSN: "postgres://webdev:webdev@127.0.0.1:5432/webdev?sslmode=disable"
+      WEBDEV_IT_MYSQL_DSN: "root:webdev@tcp(127.0.0.1:3306)/webdev?parseTime=true&multiStatements=true"
+      WEBDEV_IT_SQLSERVER_DSN: "sqlserver://sa:Webdev!Passw0rd@127.0.0.1:1433?database=master"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Entegrasyon testleri
+        run: go test -tags integration -race -count=1 -run TestIntegration -v ./pkg/db/
+        env:
+          CGO_ENABLED: "1"
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...

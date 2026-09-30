@@ -1,147 +1,207 @@
-# pkg/db/db.go Kullanım Kılavuzu
+# db
 
-Bu doküman, `pkg/db/db.go` dosyasındaki fonksiyonların ve yapıların detaylı kullanımını ve örneklerini içerir.
-
----
-
-## Yapılandırma: `Config`
-
-Veritabanı bağlantısı için gerekli tüm ayarları içerir.
+GORM tabanlı, çoklu veritabanı (PostgreSQL, MySQL, SQLite, SQL Server) yardımcıları:
+global bağlantı, `${param}` yer tutuculu SQL çalıştırma, toplu insert/upsert/update,
+transaction, sürüm takipli migration, geçici hatalara özel retry ve devre kesici.
 
 ```go
-Config{
-    Driver: "postgres", // veya "mysql", "sqlite", "sqlserver"
-    DSN: "user:pass@/dbname",
-    MaxOpenConns: 10,
-    MaxIdleConns: 5,
-    ConnMaxLifetime: time.Hour,
-    RetryAttempts: 3,
-    RetryDelay: time.Second,
-    EnableLogging: true,
-    SlowThreshold: 200 * time.Millisecond,
-    EnableBreaker: true,
-    BreakerFailThreshold: 5,
-    BreakerOpenTimeout: time.Minute,
-    ConnLabel: "primary",
-    DatabaseName: "mydb",
-    EnableStmtCache: true,
-    StmtCacheSize: 100,
+import mydb "github.com/mustafacaglarkara/webdev/pkg/db"
+```
+
+## Güvenlik kuralları (önce bunu okuyun)
+
+| Argüman | Tür | Nasıl işlenir |
+|---|---|---|
+| `table`, `cols`, `conflictCols`, `updateCols`, `keyCol` | **tanımlayıcı** | `^[A-Za-z_][A-Za-z0-9_]*` kalıbıyla (en fazla `şema.tablo.kolon`) doğrulanır, diyalekte göre tırnaklanır (`"x"`, `` `x` ``, `[x]`). Geçersizse `sqlutil.ErrInvalidIdentifier` döner, SQL üretilmez. |
+| `rows`, `params` değerleri | **değer** | Her zaman parametre olarak bağlanır; SQL metnine yazılmaz. |
+| `sqlText`, `.sql` dosyaları | **güvenilir SQL** | Olduğu gibi çalışır. Kullanıcı girdisini asla SQL metnine birleştirmeyin; `${ad}` kullanın. |
+| `UpsertOptions.SQLServerTableHint` | izin listesi | Yalnızca `HOLDLOCK, SERIALIZABLE, UPDLOCK, ROWLOCK, PAGLOCK, TABLOCK, TABLOCKX, XLOCK, READCOMMITTED, READCOMMITTEDLOCK, REPEATABLEREAD`. |
+| `UpsertOptions.SQLServerOutput` | katı kalıp | Yalnızca `OUTPUT $action, INSERTED.kolon, DELETED.kolon [AS takma_ad]`; `INTO`, alt sorgu vb. reddedilir. |
+
+## Yapılandırma
+
+```go
+err := mydb.Init(mydb.Config{
+	Driver:          "postgres", // postgres | mysql | sqlite | sqlserver
+	DSN:             "host=localhost user=app password=app dbname=app sslmode=disable",
+	MaxOpenConns:    10,
+	MaxIdleConns:    5,
+	ConnMaxLifetime: time.Hour,
+
+	RetryAttempts: 3,                      // <=1 ise retry kapalı
+	RetryDelay:    100 * time.Millisecond,
+	RetryWrites:   false,                  // yazma/Tx yeniden denemesi (yalnızca idempotent işlemler için)
+
+	EnableBreaker:        true,
+	BreakerFailThreshold: 5,
+	BreakerOpenTimeout:   30 * time.Second,
+
+	EnableLogging: true,
+	SlowThreshold: 200 * time.Millisecond,
+	ConnLabel:     "primary",
+	DatabaseName:  "app",
+
+	EnableStmtCache: true, // ExecPrepared / QueryPrepared
+	StmtCacheSize:   100,  // <=0 sınırsız, aksi halde LRU
+})
+defer mydb.Close()
+```
+
+`Init` yeniden çağrılabilir: önceki bağlantı ve statement cache kapatılır.
+`DB()` global `*gorm.DB` döner.
+
+### Retry ve devre kesici
+
+- Yalnızca **geçici** hatalar yeniden denenir: `driver.ErrBadConn`, bağlantı reset/refused,
+  PostgreSQL `40001`/`40P01`/`08xxx`, SQL Server `1205` (deadlock) vb., MySQL `1213`/`1205`,
+  SQLite `BUSY`/`LOCKED`. Zaman aşımı yalnızca okumalarda yeniden denenir.
+- **Okumalar** (`QueryString`, `QuerySQL`, `QueryPrepared`) `RetryAttempts` kadar denenir.
+- **Yazmalar ve transaction'lar** (`Exec*`, `Bulk*`, `Tx`, `ExecReturning*`) varsayılan olarak
+  denenmez; `Config.RetryWrites = true` veya çağrı bazında `mydb.WithWriteRetry(ctx, true)` ile açılır.
+- Context iptali asla yeniden denenmez ve devre kesicide hata sayılmaz; `sql.ErrNoRows`,
+  `gorm.ErrRecordNotFound` ve kısıt ihlalleri de sayılmaz.
+- Sınıflandırıcılar dışa açıktır: `mydb.IsTransient(err)`, `mydb.IsTimeout(err)`,
+  `mydb.IsConstraintViolation(err)`.
+
+## SQL çalıştırma
+
+`${ad}` yer tutucuları parametreye dönüştürülür. Dilim değerler `?,?,?` olarak açılır
+(`[]byte` tek değerdir). Eksik parametre hata verir.
+
+```go
+ctx := context.Background()
+
+n, err := mydb.ExecString(ctx,
+	"UPDATE users SET name = ${name} WHERE id = ${id}",
+	map[string]any{"name": "Ali", "id": 1})
+
+type User struct {
+	ID    int64
+	Email string
+	Name  string
 }
-```
-
----
-
-## Temel Fonksiyonlar
-
-### Init(cfg Config) error
-Veritabanı bağlantısını başlatır. Uygulama başında bir kez çağrılmalıdır.
-
-```go
-err := db.Init(cfg)
-if err != nil {
-    log.Fatal(err)
-}
-```
-
-### DB() *gorm.DB
-Global veritabanı nesnesini döner. Init sonrası kullanılabilir.
-
-### Close() error
-Veritabanı bağlantısını ve varsa statement cache'i kapatır.
-
----
-
-## SQL Çalıştırma Fonksiyonları
-
-### ExecString(ctx, sqlText, params)
-SQL metnini parametrelerle çalıştırır. DML/DDL için uygundur.
-
-```go
-rows, err := db.ExecString(ctx, "UPDATE users SET name=${name} WHERE id=${id}", map[string]any{"name": "Ali", "id": 1})
-```
-
-### QueryString[T](ctx, sqlText, params, &dest)
-SQL sorgusunu çalıştırır ve sonucu slice olarak döner.
-
-```go
-type User struct { ID int; Name string }
 var users []User
-err := db.QueryString(ctx, "SELECT * FROM users WHERE id IN (${ids})", map[string]any{"ids": []int{1,2,3}}, &users)
+err = mydb.QueryString(ctx,
+	"SELECT id, email, name FROM users WHERE id IN (${ids})",
+	map[string]any{"ids": []int64{1, 2, 3}}, &users)
 ```
 
-### ExecSQL(ctx, fsys, file, params)
-Bir .sql dosyasını okuyup parametrelerle çalıştırır.
+Boş liste:
 
-### QuerySQL[T](ctx, fsys, file, params, &dest)
-Bir .sql dosyasını okuyup sonucu slice olarak döner.
+- `kolon IN (${ids})` → `1=0`
+- `kolon NOT IN (${ids})` → `1=1`
+- karmaşık ifade + `IN` → `IN (NULL)` (doğru: hiçbir satır)
+- karmaşık ifade + `NOT IN` → hata (yanlış sonuç vermek yerine)
 
----
-
-## Hazır Fonksiyonlar
-
-- InsertString, UpdateString, DeleteString: DML işlemleri için kısa yol.
-- InsertSQL, UpdateSQL, DeleteSQL, SelectSQL: Dosya tabanlı kısa yollar.
-
----
-
-## Toplu İşlemler
-
-### BulkInsertRows
-Çoklu satırı tek seferde ekler.
+Dosya tabanlı sürümler: `ExecSQL`, `InsertSQL`, `UpdateSQL`, `DeleteSQL`, `QuerySQL`,
+`SelectSQL`, `ExecReturningSQL` (ilk argümanlar `fs.FS` ve dosya yolu).
+Metin kısayolları: `InsertString`, `UpdateString`, `DeleteString`, `ExecReturningString`.
 
 ```go
-rows := [][]any{{1, "Ali"}, {2, "Veli"}}
-count, err := db.BulkInsertRows(ctx, "users", []string{"id", "name"}, rows, 100)
+//go:embed sql
+var sqlFS embed.FS
+
+_, err := mydb.ExecSQL(ctx, sqlFS, "sql/queries/insert_user.sql",
+	map[string]any{"email": "a@b.com", "name": "Ada"})
 ```
 
-### BulkUpsertRows
-Çoklu satırı upsert (varsa güncelle, yoksa ekle) olarak işler.
+`dest` `nil` ise hata döner (panik yok).
 
-### BulkUpsertRowsWithOptions
-SQL Server için gelişmiş upsert seçenekleri sunar.
+### Prepared statement cache
 
-### BulkUpdateByKey
-Anahtar sütuna göre toplu güncelleme yapar.
+`EnableStmtCache` açıkken `ExecPrepared` / `QueryPrepared` SQL'i diyalektin kendi yer
+tutucusuyla (`$1`, `@p1`, `?`) hazırlar ve LRU cache'te tutar. Tahliye edilen bir statement,
+onu kullanan çağrı bitene kadar kapatılmaz. Hazırlama hatası döndürülür. Kapalıysa
+`ExecString` / `QueryString` ile aynıdır.
 
----
+```go
+_, err := mydb.ExecPrepared(ctx, "INSERT INTO kv (k, v) VALUES (${k}, ${v})",
+	map[string]any{"k": "a", "v": "1"})
+prepares, hits := mydb.StmtMetrics()
+```
 
-## Statement Cache ve Ölçüm
+## Toplu işlemler
 
-- **prepareAndCache**: SQL sorgularını cache'ler.
-- **StmtMetrics**: Kaç prepare ve cache hit olduğunu döner.
+```go
+cols := []string{"email", "name"}
+rows := [][]any{{"b@b.com", "Bob"}, {"c@b.com", "Cem"}}
 
----
+// INSERT
+n, err := mydb.BulkInsertRows(ctx, "users", cols, rows, 0)
 
-## Context Yardımcıları
+// UPSERT: Postgres/SQLite ON CONFLICT, MySQL ON DUPLICATE KEY, SQL Server MERGE.
+// updateCols boşsa çakışan satırlar değişmez (DO NOTHING).
+n, err = mydb.BulkUpsertRows(ctx, "users", cols, []string{"email"}, []string{"name"}, rows, 0)
 
-- WithTraceID, WithTxID, WithQueryID: Context'e izleme bilgisi ekler.
-- TraceIDFromCtx, TxIDFromCtx, QueryIDFromCtx: Context'ten izleme bilgisini okur.
+// SQL Server MERGE seçenekleri
+n, err = mydb.BulkUpsertRowsWithOptions(ctx, "dbo.users", cols, []string{"email"}, []string{"name"}, rows, 0,
+	&mydb.UpsertOptions{
+		SQLServerTableHint: "WITH (HOLDLOCK)",
+		Output:             &mydb.UpsertOutput{IncludeAction: true, InsertedCols: []string{"id"}},
+	})
 
----
+// Anahtara göre toplu UPDATE (CASE WHEN ... END)
+upd := []map[string]any{{"id": 1, "name": "Yeni"}, {"id": 2, "name": "Yeni2"}}
+n, err = mydb.BulkUpdateByKey(ctx, "users", "id", []string{"name"}, upd, 0)
+```
+
+- Her satırın uzunluğu kolon sayısına eşit olmalıdır; değilse hata döner.
+- `batchSize <= 0` ise diyalekte göre seçilir. Batch boyutu **satır başına gerçek
+  parametre sayısına** göre hesaplanır ve sınırın (SQLite 999, SQL Server 2000, Postgres/MySQL
+  65535) üzerine çıkmayacak şekilde kırpılır (`BulkUpdateByKey` için satır başına
+  `2*len(updateCols)+1`).
+- Birden fazla batch **tek transaction** içinde çalışır: bir batch başarısız olursa hiçbir satır yazılmaz.
+
+## Transaction
+
+```go
+err := mydb.Tx(ctx, func(ctx context.Context, tx *gorm.DB) error {
+	if err := tx.Exec("INSERT INTO items(name) VALUES (?)", "a").Error; err != nil {
+		return err // rollback
+	}
+	return nil // commit
+})
+```
+
+`Tx` varsayılan olarak yeniden denenmez (bkz. retry).
 
 ## Migration
 
-### MigrateDir
-Bir dizindeki tüm .sql dosyalarını sıralı ve tek transaction ile çalıştırır.
+`MigrateDir` [`pkg/migrate`](../migrate/README.md) kullanır: sürümler `schema_migrations`
+tablosunda takip edilir, yalnızca bekleyen dosyalar artan sırada ve her biri kendi
+transaction'ında çalışır.
 
 ```go
-err := db.MigrateDir(ctx, os.DirFS("./migrations"), ".")
+//go:embed sql/migrations
+var migFS embed.FS
+
+err := mydb.MigrateDir(ctx, migFS, "sql/migrations")
 ```
 
----
+Dosya adları: `<sürüm>_<ad>.up.sql` veya `<sürüm>_<ad>.sql` (ör. `001_init.sql`,
+`20240101120000_users.up.sql`). `.down.sql` dosyaları `MigrateDir` ile çalışmaz; geri alma
+için `migrate.New(sqlDB, fsys, dir).Down(ctx, 1)` kullanın. Adlandırma kuralına uymayan `.sql`
+dosyası hata verir.
 
-## Hata Yönetimi ve Retry
+## Context yardımcıları
 
-- Retry ve circuit breaker desteği vardır. Config ile açılır.
+`WithTraceID`, `WithTxID`, `WithQueryID`, `WithNewQueryID`, `TraceIDFromCtx`, `TxIDFromCtx`,
+`QueryIDFromCtx` — log korelasyonu için. `WithWriteRetry(ctx, bool)` — çağrı bazında yazma retry'ı.
 
----
+## Geçiş notları (davranış değişiklikleri)
 
-## Notlar
-- Fonksiyonlar, `db.Init` çağrılmadan çalışmaz.
-- Parametreli SQL için `${param}` kullanılır.
-- Tüm işlemler context ile izlenebilir ve loglanabilir.
+| Konu | Eski | Yeni |
+|---|---|---|
+| Tanımlayıcılar | Tablo/kolon adları SQL'e olduğu gibi yazılırdı | Doğrulanır ve diyalekte göre tırnaklanır; geçersiz ad `sqlutil.ErrInvalidIdentifier` döner |
+| PostgreSQL adları | Tırnaksız adlar küçük harfe katlanırdı | Tırnaklı adlar **büyük/küçük harfe duyarlıdır**: `UserName` artık `username` ile eşleşmez. Şemadaki yazımla aynı adı verin |
+| Yeniden deneme | Her hata yeniden denenirdi | Yalnızca geçici hatalar; yazma işlemleri ve `Tx` ancak `Config.RetryWrites` veya `WithWriteRetry(ctx, true)` ile |
+| Devre kesici | Her hata sayılırdı | Context iptali, `sql.ErrNoRows` ve kısıt ihlalleri sayılmaz |
+| `ExecPrepared` | Prepare hatasında sessizce düz sorguya düşerdi | Hatayı döndürür |
+| Çok batch'li toplu işlem | Hata anında kısmi toplam dönerdi | Tek transaction; hata olursa `(0, err)` ve hiçbir şey yazılmaz |
+| Batch boyutu | Kolon sayısından hesaplanırdı | Gerçek parametre sayısından; diyalekt sınırına (SQL Server 2000, SQLite 999) kırpılır |
+| Boş dilim bağlama | `IN (NULL)` | `col IN (...)` → `1=0`, `col NOT IN (...)` → `1=1` |
+| `SQLServerTableHint` / `SQLServerOutput` | Her metin kabul edilirdi | İzin listesi / katı desen dışındakiler hata döner |
+| `MigrateDir` | Tüm dosyalar tek transaction, takip yok | `pkg/migrate` ile sürüm takibi; dosya başına transaction; `.down.sql` yok sayılır |
 
----
-
-Daha fazla detay ve örnek için kodun içindeki yorumlara bakabilirsiniz.
-
+> PostgreSQL, MySQL ve SQL Server için üretilen SQL metni testlerle doğrulanır; uçtan uca yalnızca
+> SQLite üzerinde çalıştırılmıştır. Bu veritabanlarında yayına almadan önce kendi ortamınızda deneyin.

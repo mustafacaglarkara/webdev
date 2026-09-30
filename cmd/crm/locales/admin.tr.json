@@ -1,0 +1,13 @@
+{
+  "admin.title": "Yönetim paneli",
+  "admin.intro": "Bu sayfa iki katmanla korunur: rol kontrolü (admin) ve casbin politikası.",
+  "admin.users_title": "Demo kullanıcılar",
+  "admin.col_username": "Kullanıcı adı",
+  "admin.col_name": "Ad",
+  "admin.col_role": "Rol",
+  "admin.policies_title": "Casbin politikaları",
+  "admin.policies_note": "Politikalar en son {{.Time}} tarihinde yüklendi.",
+  "admin.col_subject": "Özne",
+  "admin.col_object": "Nesne",
+  "admin.col_action": "Eylem"
+}

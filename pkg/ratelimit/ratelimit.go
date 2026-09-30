@@ -9,25 +9,32 @@ import (
 	"time"
 )
 
-// Limiter: token bucket rate limiter
-// capacity: kovadaki maksimum token
-// refillEvery: her doldurma aralığı
-// refillAmount: her aralıkta kovaya eklenecek token miktarı
-// Not: burst = capacity. Ortalama hız = refillAmount / refillEvery
-// Örn: dakikada 30 istek ve burst 10 için: capacity=10, refillEvery=2s, refillAmount=1 (30/dk ~= 1 token/2sn)
-type Limiter struct {
-	capacity     int
-	tokens       int
-	refillEvery  time.Duration
-	refillAmount int
+// ErrClosed Close çağrıldıktan sonra Wait/Do tarafından döner.
+var ErrClosed = errors.New("limiter closed")
 
-	mu     sync.Mutex
-	closed bool
-	stopCh chan struct{}
+// Limiter token bucket rate limiter.
+//
+// Token'lar arka plan goroutine'i veya tick olmadan, geçen süreye göre
+// sürekli (kesirli) olarak doldurulur: hız = rate / perInterval. Bu sayede
+// perInterval/rate çok küçük olduğunda (ör. saniyede 1 milyon) yuvarlama veya
+// 1 ms tick alt sınırı nedeniyle hız bozulmaz. Kapasite (burst) aşılmaz.
+//
+// Limiter eşzamanlı kullanım için güvenlidir.
+type Limiter struct {
+	mu       sync.Mutex
+	capacity float64
+	tokens   float64
+	ratePerN float64 // token / nanosaniye
+	last     time.Time
+	now      func() time.Time
+
+	closed  bool
+	closeCh chan struct{}
 }
 
-// NewLimiter: rate (perInterval sürede allowed adet işlem), burst kapasitesi ile yeni limiter oluşturur.
+// NewLimiter: rate (perInterval sürede izin verilen işlem sayısı), burst kapasitesi ile yeni limiter oluşturur.
 // Örn: rate=30, per=1*time.Minute, burst=10 => dakikada 30 işlem, anlık 10'a kadar patlamaya izin ver.
+// Kova dolu başlar.
 func NewLimiter(rate int, perInterval time.Duration, burst int) (*Limiter, error) {
 	if rate <= 0 || perInterval <= 0 {
 		return nil, errors.New("invalid rate/perInterval")
@@ -35,86 +42,90 @@ func NewLimiter(rate int, perInterval time.Duration, burst int) (*Limiter, error
 	if burst <= 0 {
 		burst = 1
 	}
-	// refill parametrelerini hesapla: her tick'te 1 token eklemek için tick = perInterval / rate
-	tick := perInterval / time.Duration(rate)
-	if tick <= 0 {
-		tick = time.Millisecond
-	}
-	l := &Limiter{
-		capacity:     burst,
-		tokens:       burst,
-		refillEvery:  tick,
-		refillAmount: 1,
-		stopCh:       make(chan struct{}),
-	}
-	go l.refiller()
-	return l, nil
+	ratePerN := float64(rate) / float64(perInterval)
+	return &Limiter{
+		capacity: float64(burst),
+		tokens:   float64(burst),
+		ratePerN: ratePerN,
+		last:     time.Now(),
+		now:      time.Now,
+		closeCh:  make(chan struct{}),
+	}, nil
 }
 
-func (l *Limiter) refiller() {
-	t := time.NewTicker(l.refillEvery)
-	defer t.Stop()
-	for {
-		select {
-		case <-l.stopCh:
-			return
-		case <-t.C:
-			l.mu.Lock()
-			if l.closed {
-				l.mu.Unlock()
-				return
-			}
-			if l.tokens < l.capacity {
-				l.tokens += l.refillAmount
-				if l.tokens > l.capacity {
-					l.tokens = l.capacity
-				}
-			}
-			l.mu.Unlock()
+// refill geçen süreye göre token ekler. mu tutulmalıdır.
+func (l *Limiter) refill(now time.Time) {
+	if el := now.Sub(l.last); el > 0 {
+		l.tokens += float64(el) * l.ratePerN
+		if l.tokens > l.capacity {
+			l.tokens = l.capacity
 		}
+		l.last = now
 	}
 }
 
-// Allow: token varsa hemen tüketir ve true döner; yoksa false döner.
+// Allow: token varsa hemen tüketir ve true döner; yoksa (veya limiter kapalıysa) false döner.
 func (l *Limiter) Allow() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.closed {
 		return false
 	}
-	if l.tokens > 0 {
+	l.refill(l.now())
+	if l.tokens >= 1 {
 		l.tokens--
 		return true
 	}
 	return false
 }
 
-// Wait: bir token mevcut olana kadar (veya context iptal edilene kadar) bekler.
+// reserve token alır ya da bir sonraki token için beklenmesi gereken süreyi döner.
+func (l *Limiter) reserve() (wait time.Duration, ok bool, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return 0, false, ErrClosed
+	}
+	l.refill(l.now())
+	if l.tokens >= 1 {
+		l.tokens--
+		return 0, true, nil
+	}
+	missing := 1 - l.tokens
+	wait = time.Duration(missing / l.ratePerN)
+	if wait < time.Microsecond {
+		wait = time.Microsecond
+	}
+	return wait, false, nil
+}
+
+// Wait: bir token mevcut olana kadar bekler. ctx iptal edilirse ctx.Err(),
+// limiter kapatılırsa ErrClosed döner. Polling yapılmaz; bir sonraki token'ın
+// dolacağı ana kadar uyunur.
 func (l *Limiter) Wait(ctx context.Context) error {
-	// polling periyodu: refillEvery'nin min(50ms, refillEvery) olması yeterli
-	poll := l.refillEvery
-	if poll > 50*time.Millisecond {
-		poll = 50 * time.Millisecond
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	for {
-		l.mu.Lock()
-		if l.closed {
-			l.mu.Unlock()
-			return errors.New("limiter closed")
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		if l.tokens > 0 {
-			l.tokens--
-			l.mu.Unlock()
+		wait, ok, err := l.reserve()
+		if err != nil {
+			return err
+		}
+		if ok {
 			return nil
 		}
-		l.mu.Unlock()
-		t := time.NewTimer(poll)
+		t := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			t.Stop()
 			return ctx.Err()
+		case <-l.closeCh:
+			t.Stop()
+			return ErrClosed
 		case <-t.C:
-			// tekrar dene
 		}
 	}
 }
@@ -127,14 +138,17 @@ func (l *Limiter) Do(ctx context.Context, fn func() error) error {
 	return fn()
 }
 
-// Close: limiter'ı kapatır, refiller goroutine'ini durdurur.
+// Close limiter'ı kapatır. Close sonrası Allow false, Wait/Do ErrClosed döner;
+// Wait içinde bekleyen çağrılar hemen uyandırılır. Close birden fazla kez
+// çağrılabilir (idempotent). Limiter arka plan goroutine'i kullanmadığından
+// Close çağrılmaması kaynak sızıntısına yol açmaz; ancak bekleyenleri serbest
+// bırakmak için kapanışta çağrılması önerilir.
 func (l *Limiter) Close() {
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.closed {
-		l.mu.Unlock()
 		return
 	}
 	l.closed = true
-	close(l.stopCh)
-	l.mu.Unlock()
+	close(l.closeCh)
 }

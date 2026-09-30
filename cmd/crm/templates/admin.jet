@@ -1,0 +1,25 @@
+<section>
+  <h1>{{ t(ctx, "admin.title") }}</h1>
+  <p>{{ t(ctx, "admin.intro") }}</p>
+
+  <h2>{{ t(ctx, "admin.users_title") }}</h2>
+  <table class="grid">
+    <thead><tr><th>ID</th><th>{{ t(ctx, "admin.col_username") }}</th><th>{{ t(ctx, "admin.col_name") }}</th><th>{{ t(ctx, "admin.col_role") }}</th></tr></thead>
+    <tbody>
+    {{- range _, u := Users }}
+      <tr><td>{{ u.ID }}</td><td>{{ u.Username }}</td><td>{{ u.Name }}</td><td>{{ u.Role }}</td></tr>
+    {{- end }}
+    </tbody>
+  </table>
+
+  <h2>{{ t(ctx, "admin.policies_title") }}</h2>
+  <p class="muted">{{ t(ctx, "admin.policies_note", dict("Time", date(LastReload, "2006-01-02 15:04:05"))) }}</p>
+  <table class="grid">
+    <thead><tr><th>{{ t(ctx, "admin.col_subject") }}</th><th>{{ t(ctx, "admin.col_object") }}</th><th>{{ t(ctx, "admin.col_action") }}</th></tr></thead>
+    <tbody>
+    {{- range _, rule := Policies }}
+      <tr><td>{{ rule[0] }}</td><td><code>{{ rule[1] }}</code></td><td>{{ rule[2] }}</td></tr>
+    {{- end }}
+    </tbody>
+  </table>
+</section>

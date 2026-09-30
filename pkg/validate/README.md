@@ -1,50 +1,63 @@
 # validate
 
-Veri doğrulama işlemleri için yardımcı fonksiyonlar içerir. E-posta, URL ve boşluk kontrolü gibi temel doğrulama fonksiyonları sağlar.
+Bağımlılıksız, yan etkisiz basit doğrulama yüklemleri (`func(string) bool`).
 
-## Fonksiyonlar ve Detaylı Kullanım Örnekleri
+```go
+import "github.com/mustafacaglarkara/webdev/pkg/validate"
+```
 
-### IsEmail
-Bir string'in geçerli bir e-posta adresi olup olmadığını kontrol eder.
+## Doğrulama paketlerinin ilişkisi
+
+```
+pkg/validate    (bu paket) basit yüklemler — e-posta/URL kontrolünün TEK uygulaması
+     ↑
+pkg/validation  kural motoru ("required|email|min:3", struct tag'leri)
+     ↑
+pkg/forms       form katmanı
+```
+
+Bu paket diğer ikisini içe aktarmaz. `pkg/validation`'daki `email`/`url`
+kuralları ve `validate:"email"`/`validate:"url"` etiketleri buradaki
+fonksiyonları çağırır; sonuçlar her zaman aynıdır.
+
+## Fonksiyonlar
+
+| Fonksiyon | Açıklama |
+|---|---|
+| `IsEmail(s)` | Yalın e-posta adresi. Görünen adlı (`Ali <ali@x.com>`) ve açıklamalı biçimler, baş/son boşluk, noktasız alan adı (`ali@localhost`), 254 karakteri aşan adresler reddedilir. UTF-8 adresler (`çağlar@örnek.com.tr`) kabul edilir. |
+| `IsURL(s)` | Host içeren mutlak **http/https** URL. `ftp:`, `javascript:`, `mailto:` reddedilir. |
+| `IsURLWithSchemes(s, şemalar...)` | Verilen şemalardan biriyle mutlak URL (büyük/küçük harf duyarsız). |
+| `NotEmpty(s)` | `s != ""` (boşluk içerik sayılır). |
+| `IsBlank(s)` | Boş veya yalnızca boşluk. |
+| `IsNumeric(s)` | Ondalık/tam sayı (`"12"`, `"-3.5"`, `"1e3"`); NaN/Inf hayır. |
+| `IsInteger(s)` | İşaretli tam sayı. |
+| `IsAlpha(s)` | Yalnızca Unicode harf (Türkçe dahil). |
+| `IsAlphaNum(s)` | Yalnızca Unicode harf ve rakam. |
+| `IsBoolean(s)` | `1, 0, true, false, on, off` (büyük/küçük harf duyarsız). |
+
+## Örnek
 
 ```go
 package main
+
 import (
-    "fmt"
-    "your/module/path/pkg/validate"
+	"fmt"
+
+	"github.com/mustafacaglarkara/webdev/pkg/validate"
 )
+
 func main() {
-    fmt.Println(validate.IsEmail("ali@example.com")) // true
-    fmt.Println(validate.IsEmail("hatalı-email"))    // false
-    fmt.Println(validate.IsEmail(""))                // false
+	fmt.Println(validate.IsEmail("ali@example.com"))       // true
+	fmt.Println(validate.IsEmail("Ali <ali@example.com>")) // false
+	fmt.Println(validate.IsEmail("ali@localhost"))         // false
+
+	fmt.Println(validate.IsURL("https://golang.org"))                 // true
+	fmt.Println(validate.IsURL("ftp://example.com"))                  // false
+	fmt.Println(validate.IsURLWithSchemes("ftp://example.com", "ftp")) // true
+
+	fmt.Println(validate.IsAlpha("Çağlar"))  // true
+	fmt.Println(validate.IsNumeric("3,14"))  // false (ondalık ayraç nokta olmalı)
+	fmt.Println(validate.NotEmpty("  "))     // true
+	fmt.Println(validate.IsBlank("  "))      // true
 }
 ```
-
-### IsURL
-Bir string'in geçerli bir URL olup olmadığını kontrol eder (http/https, host zorunlu).
-
-```go
-fmt.Println(validate.IsURL("https://golang.org"))      // true
-fmt.Println(validate.IsURL("ftp://example.com"))       // true
-fmt.Println(validate.IsURL("localhost:8080"))          // false
-fmt.Println(validate.IsURL("http:///eksik.com"))       // false
-fmt.Println(validate.IsURL(""))                        // false
-```
-
-### NotEmpty
-Bir string'in boş olup olmadığını kontrol eder.
-
-```go
-fmt.Println(validate.NotEmpty("merhaba")) // true
-fmt.Println(validate.NotEmpty(""))        // false
-```
-
-## Edge-Case ve Hata Yönetimi
-- IsEmail: Boş string veya hatalı format false döner.
-- IsURL: Sadece scheme ve host olan URL'ler true döner, eksik veya hatalı format false döner.
-- NotEmpty: Sadece boş string için false döner, whitespace karakterler true kabul edilir.
-
-## Notlar
-- Tüm fonksiyonlar hızlı ve yan etkisizdir.
-- E-posta ve URL doğrulama için Go'nun standart kütüphaneleri kullanılır.
-- Daha fazla detay için kodu inceleyebilirsiniz.

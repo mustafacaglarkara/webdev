@@ -1,97 +1,94 @@
 # localization
 
-Çoklu dil desteği için yardımcı katman. Laravel/Django'daki gibi JSON/array tabanlı dil dosyaları ile çalışır. Context ile dil yönetimi, parametreli mesajlar ve fallback desteği sunar.
-
-## Tavsiye Edilen Paket: [nicksnyder/go-i18n](https://github.com/nicksnyder/go-i18n)
-
----
-
-## Temel Kullanım
-
-### 1. Manager Oluşturma ve JSON Dosyası Yükleme
+[nicksnyder/go-i18n](https://github.com/nicksnyder/go-i18n) tabanlı çoklu dil
+yardımcıları: JSON dil dosyaları, parametreli mesajlar, varsayılan dile düşme,
+eksik çeviri kancası ve `Accept-Language` ayrıştırma.
 
 ```go
-import (
-    "embed"
-    "github.com/nicksnyder/go-i18n/v2/i18n"
-    "golang.org/x/text/language"
-    "your/module/path/pkg/localization"
-)
+import "github.com/mustafacaglarkara/webdev/pkg/localization"
+```
 
+## Manager
+
+```go
 //go:embed locales/*.json
 var locales embed.FS
 
-mgr := localization.New(language.Turkish)
-err := mgr.LoadFS(locales, "locales/*.json")
-if err != nil {
-    panic(err)
+mgr := localization.New(language.Turkish) // varsayılan dil
+if err := mgr.LoadFS(locales, "locales/*.json"); err != nil {
+	log.Fatal(err)
 }
+
+mgr.T([]string{"tr"}, "hello", nil)                                   // "Merhaba!"
+mgr.T([]string{"en"}, "hello", nil)                                   // "Hello!"
+mgr.T([]string{"tr"}, "welcome_user", map[string]any{"Name": "Ali"})  // "Hoş geldin, Ali!"
+mgr.T([]string{"fr", "tr"}, "hello", nil)                             // "Merhaba!"
+mgr.T([]string{"tr"}, "not_exist", nil)                               // "not_exist"
 ```
 
-### 2. Basit Mesaj Çözümleme
+`T` davranışı:
 
-```go
-msg := mgr.T([]string{"tr"}, "hello", nil) // "Merhaba!"
-msg2 := mgr.T([]string{"en"}, "hello", nil) // "Hello!"
-```
+- Mesaj istenen dillerde yoksa **varsayılan dildeki çeviri** döner.
+- Hiçbir dilde yoksa `msgID` döner.
+- Her iki durumda da `OnMissing` kancası (tanımlıysa) çağrılır.
 
-### 3. Parametreli Mesaj
-
-```go
-msg := mgr.T([]string{"tr"}, "welcome_user", map[string]any{"Name": "Ali"}) // "Hoş geldin, Ali!"
-```
-
-### 4. Fallback ve Eksik Çeviri
-
-```go
-msg := mgr.T([]string{"fr", "tr"}, "hello", nil) // "Merhaba!" (fr yoksa tr'ye düşer)
-msg := mgr.T([]string{"tr"}, "not_exist", nil)    // "not_exist" (eksikse anahtar döner)
-```
-
-### 5. Context ile Dil Yönetimi
-
-```go
-ctx := localization.WithLang(context.Background(), "en")
-lang := localization.LangFromCtx(ctx, "tr") // "en"
-msg := mgr.T([]string{lang}, "hello", nil)
-```
-
-### 6. Localizer ile Gelişmiş Kullanım
+Gelişmiş kullanım için doğrudan go-i18n localizer'ı:
 
 ```go
 loc := mgr.Localizer("tr", "en")
 msg, err := loc.Localize(&i18n.LocalizeConfig{MessageID: "bye"})
 ```
 
----
-
-## HTTP / Fiber ile Kullanım (Önerilen)
+## Eksik çeviri kancası
 
 ```go
-import (
-    "github.com/gofiber/fiber/v2"
-    "github.com/mustafacaglarkara/webdev/pkg/web"
-    "github.com/mustafacaglarkara/webdev/pkg/localization"
-)
-
-// Dil belirleme (Accept-Language + fallback)
-func Handler(c *fiber.Ctx) error {
-    langs := web.FiberLangs(c, "tr")
-    msg := localization.TDefault(langs, "home.title", nil)
-    return c.SendString(msg)
-}
-
-// Dil değiştirme (session'a kaydet)
-func SwitchLang(c *fiber.Ctx) error {
-    code := c.Params("code") // "tr" veya "en"
-    _ = web.FiberSetPreferredLang(c, code)
-    return c.Redirect("/", fiber.StatusFound)
-}
+mgr.OnMissing(func(langs []string, msgID string, err error) {
+	slog.Warn("eksik çeviri", "id", msgID, "langs", langs, "err", err)
+})
+mgr.OnMissing(nil) // kancayı kaldırır
 ```
 
----
+## Varsayılan manager
 
-## JSON Dil Dosyası Örneği (locales/active.tr.json)
+```go
+if err := localization.InitDefault(language.Turkish, locales, "locales/*.json"); err != nil {
+	log.Fatal(err)
+}
+msg := localization.TDefault([]string{"en"}, "hello", nil) // başlatılmadıysa "hello"
+
+localization.SetDefault(mgr)     // hazır bir manager'ı varsayılan yap
+m := localization.Default()      // başlatılmadıysa nil
+_, _ = msg, m
+```
+
+Varsayılan manager `atomic.Pointer` ile tutulur; eşzamanlı okuma/yazma güvenlidir.
+Başarısız `InitDefault` mevcut varsayılanı değiştirmez. `Manager.T` eşzamanlı
+çağrılabilir; `LoadFS` yazma kilidi alır.
+
+## Context ile dil
+
+```go
+ctx := localization.WithLang(r.Context(), "en")
+lang := localization.LangFromCtx(ctx, "tr") // "en" (yoksa/boşsa "tr")
+```
+
+## ParseAcceptLanguage
+
+```go
+localization.ParseAcceptLanguage("en;q=0.5, tr;q=0.9", "tr") // [tr en]
+localization.ParseAcceptLanguage("de;q=0, en-US, en;q=0.8", "tr") // [en-US en tr]
+localization.ParseAcceptLanguage("", "tr")                    // [tr]
+```
+
+- q değerine göre azalan, eşitlikte başlıktaki sırayı koruyan (kararlı) sıralama.
+- `q=0` olan diller dışlanır; geçersiz q değerli girdiler ve `*` atlanır; `q>1` 1'e kırpılır.
+- `en ; q=0.8` gibi boşluklu biçimler ve `Q=` desteklenir.
+- Aynı dil (büyük/küçük harf duyarsız) bir kez yer alır.
+- `fallback` boş değilse ve listede yoksa sona eklenir.
+
+Fiber için `fiberweb.Langs(c, "tr")` (`pkg/web/fiberweb`) bu fonksiyonu kullanır ve oturumdaki dil tercihini listenin başına koyar.
+
+## Dil dosyası örneği (`locales/active.tr.json`)
 
 ```json
 [
@@ -101,19 +98,6 @@ func SwitchLang(c *fiber.Ctx) error {
 ]
 ```
 
----
-
-## Edge-Case ve Test Senaryoları
-
-- Eksik dil dosyası: mgr.T(["fr"], "hello", nil) → fallback veya anahtar döner.
-- Eksik parametre: mgr.T(["tr"], "welcome_user", nil) → "Hoş geldin, <no value>!"
-- Context yoksa: LangFromCtx(context.Background(), "tr") → "tr"
-- JSON dosyası bozuksa: LoadFS hata döner.
-
----
-
-## Notlar
-- JSON dosyaları UTF-8 ve array formatında olmalı.
-- Parametreli mesajlar için map[string]any ile veri geçebilirsiniz.
-- Context ile dil yönetimi, handler ve middleware'lerde kolaylık sağlar.
-- Daha fazla detay ve gelişmiş kullanım için go-i18n dökümantasyonuna bakınız.
+Dosya adı dil etiketini içermelidir (`active.tr.json`, `en.json` ...). Bozuk
+JSON veya hatalı glob deseninde `LoadFS` hata döner. Eksik şablon verisi
+`<no value>` olarak basılır (go-i18n davranışı).

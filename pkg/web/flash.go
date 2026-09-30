@@ -4,153 +4,126 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sync"
 
 	"github.com/gorilla/sessions"
 )
 
-var (
-	storeMu sync.RWMutex
-	store   *sessions.CookieStore
-	// default session name for flash storage
-	flashSessionName = "session-flash"
-	// session name to store authenticated user
-	authSessionName = "session-auth"
-)
-
-// InitSessionStore initializes the cookie store with a secret key (must be 32 or 64 bytes recommended).
-// Call this once at app startup. If not called, a default insecure store will be created lazily.
-func InitSessionStore(key []byte) {
-	storeMu.Lock()
-	defer storeMu.Unlock()
-	store = sessions.NewCookieStore(key)
-	// set secure defaults (can be overridden with SetSessionOptions)
-	store.Options = &sessions.Options{
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true, // production-safe default; override in dev via SetSessionOptions
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   3600,
-	}
+// isFlashValue gorilla'nın flash olarak sakladığı değer tipini ([]interface{}) tanır.
+func isFlashValue(v any) bool {
+	_, ok := v.([]interface{})
+	return ok
 }
 
-func getStore() *sessions.CookieStore {
-	storeMu.RLock()
-	if store != nil {
-		s := store
-		storeMu.RUnlock()
-		return s
-	}
-	storeMu.RUnlock()
-	// lazy init with a fallback key (not recommended for production)
-	storeMu.Lock()
-	defer storeMu.Unlock()
-	if store == nil {
-		store = sessions.NewCookieStore([]byte("dev-secret-please-change"))
-		store.Options = &sessions.Options{
-			Path:     "/",
-			HttpOnly: true,
-			Secure:   false,
-			SameSite: http.SameSiteLaxMode,
-			MaxAge:   3600,
+func flashToStrings(fl []interface{}) []string {
+	out := make([]string, 0, len(fl))
+	for _, v := range fl {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		} else {
+			out = append(out, fmt.Sprint(v))
 		}
 	}
-	return store
+	return out
 }
 
-// GetSessionStore returns the underlying CookieStore (may be lazily initialized).
-func GetSessionStore() *sessions.CookieStore {
-	return getStore()
-}
-
-// SetSessionOptions sets options on the underlying session store (Path, HttpOnly, Secure, SameSite, MaxAge etc.).
-func SetSessionOptions(opts *sessions.Options) {
-	s := getStore()
-	s.Options = opts
-}
-
-// FlashAndRedirect: Laravel'deki redirect()->with() benzeri işlemi yapar.
-// key: örn. "success" veya "error"; message: string; url: redirect target; code: HTTP status (302/303/307/...)
-func FlashAndRedirect(w http.ResponseWriter, r *http.Request, key, message, url string, code int) error {
-	s := getStore()
-	sess, err := s.Get(r, flashSessionName)
+// AddFlash oturuma flash mesajı ekler ve kaydeder (yönlendirme yapmaz).
+func AddFlash(w http.ResponseWriter, r *http.Request, key, message string) error {
+	sess, err := getSession(r, flashSessionName)
 	if err != nil {
 		return err
 	}
 	sess.AddFlash(message, key)
-	if err := sess.Save(r, w); err != nil {
+	return sess.Save(r, w)
+}
+
+// FlashAndRedirect: Laravel'deki redirect()->with() benzeri işlemi yapar.
+// key: örn. "success" veya "error"; message: string; url: redirect target; code: HTTP status (302/303/307/...)
+// url kullanıcı girdisinden geliyorsa önce NormalizeSafeRedirect ile doğrulayın.
+func FlashAndRedirect(w http.ResponseWriter, r *http.Request, key, message, url string, code int) error {
+	if err := AddFlash(w, r, key, message); err != nil {
 		return err
 	}
 	http.Redirect(w, r, url, code)
 	return nil
 }
 
-// GetFlash returns the first flash message for the given key (or empty string). It will save the session if a flash was consumed.
+// GetFlash verilen anahtardaki İLK flash mesajını döner ve tüketir. Aynı anahtardaki diğer
+// mesajlar oturumda kalır (WEB-10); hepsini almak için GetFlashes kullanın.
 func GetFlash(w http.ResponseWriter, r *http.Request, key string) (string, error) {
-	s := getStore()
-	sess, err := s.Get(r, flashSessionName)
+	sess, err := getSession(r, flashSessionName)
 	if err != nil {
 		return "", err
+	}
+	if !isFlashValue(sess.Values[key]) {
+		return "", nil
 	}
 	fl := sess.Flashes(key)
 	if len(fl) == 0 {
 		return "", nil
 	}
+	for _, rest := range fl[1:] {
+		sess.AddFlash(rest, key)
+	}
 	if err := sess.Save(r, w); err != nil {
 		return "", err
 	}
-	if s0, ok := fl[0].(string); ok {
-		return s0, nil
-	}
-	return "", nil
+	return flashToStrings(fl[:1])[0], nil
 }
 
-// ClearFlashes clears all flashes for a session.
-func ClearFlashes(w http.ResponseWriter, r *http.Request) error {
-	s := getStore()
-	sess, err := s.Get(r, flashSessionName)
-	if err != nil {
-		return err
-	}
-	// reading flashes clears them
-	_ = sess.Flashes()
-	return sess.Save(r, w)
-}
-
-// GetAllFlashes returns all flash messages grouped by their keys. It consumes the flashes
-// (they will no longer be present after the call). Returns a map[key] -> []string.
-func GetAllFlashes(w http.ResponseWriter, r *http.Request) (map[string][]string, error) {
-	s := getStore()
-	sess, err := s.Get(r, flashSessionName)
+// GetFlashes verilen anahtardaki tüm flash mesajlarını döner ve tüketir.
+func GetFlashes(w http.ResponseWriter, r *http.Request, key string) ([]string, error) {
+	sess, err := getSession(r, flashSessionName)
 	if err != nil {
 		return nil, err
 	}
-	// collect keys first to avoid concurrent modification while calling Flashes
-	keys := make([]string, 0, len(sess.Values))
-	for k := range sess.Values {
-		if ks, ok := k.(string); ok {
-			keys = append(keys, ks)
+	if !isFlashValue(sess.Values[key]) {
+		return nil, nil
+	}
+	fl := sess.Flashes(key)
+	if len(fl) == 0 {
+		return nil, nil
+	}
+	if err := sess.Save(r, w); err != nil {
+		return nil, err
+	}
+	return flashToStrings(fl), nil
+}
+
+// ClearFlashes oturumdaki TÜM anahtarlardaki flash mesajlarını siler (WEB-9).
+// Old input gibi flash olmayan değerlere dokunmaz.
+func ClearFlashes(w http.ResponseWriter, r *http.Request) error {
+	sess, err := getSession(r, flashSessionName)
+	if err != nil {
+		return err
+	}
+	for k, v := range sess.Values {
+		if isFlashValue(v) {
+			delete(sess.Values, k)
 		}
+	}
+	return sess.Save(r, w)
+}
+
+// GetAllFlashes tüm flash mesajlarını anahtarlarına göre gruplayıp döner ve tüketir.
+// Flash olmayan değerler (ör. "old_form") atlanır; panik oluşmaz (WEB-5).
+func GetAllFlashes(w http.ResponseWriter, r *http.Request) (map[string][]string, error) {
+	sess, err := getSession(r, flashSessionName)
+	if err != nil {
+		return nil, err
 	}
 	out := make(map[string][]string)
-	consumed := false
-	for _, k := range keys {
-		fl := sess.Flashes(k)
-		if len(fl) == 0 {
+	for k, v := range sess.Values {
+		ks, ok := k.(string)
+		if !ok || !isFlashValue(v) {
 			continue
 		}
-		consumed = true
-		ss := make([]string, 0, len(fl))
-		for _, v := range fl {
-			if s0, ok := v.(string); ok {
-				ss = append(ss, s0)
-			} else {
-				ss = append(ss, fmt.Sprint(v))
-			}
+		fl := v.([]interface{})
+		delete(sess.Values, k)
+		if len(fl) > 0 {
+			out[ks] = flashToStrings(fl)
 		}
-		out[k] = ss
 	}
-	if consumed {
+	if len(out) > 0 {
 		if err := sess.Save(r, w); err != nil {
 			return out, err
 		}
@@ -158,61 +131,71 @@ func GetAllFlashes(w http.ResponseWriter, r *http.Request) (map[string][]string,
 	return out, nil
 }
 
-// SetUserInSession stores a user object (serialized as JSON) in a dedicated auth session.
-// Call this after successful login to persist the user in the cookie session.
+// ---- Kullanıcı oturumu ----
+
+const (
+	userKeyRaw  = "user"     // eski sürümlerin yazdığı ham değer (yalnızca okunur)
+	userKeyJSON = "userjson" // JSON olarak saklanan kullanıcı
+)
+
+// SetUserInSession kullanıcıyı JSON olarak ayrı bir auth oturumunda saklar. Başarılı
+// girişten sonra çağırın. user nil ise kullanıcı silinir. Eski "user" anahtarı her
+// durumda temizlenir (WEB-13). JSON'a çevrilemeyen kullanıcılar için hata döner.
+//
+// Güvenlik: InitSessionStore (tek anahtar) ile çerez yalnızca imzalıdır; içerik
+// istemci tarafından okunabilir. Parola hash'i gibi hassas alanları saklamayın veya
+// InitSessionStoreKeys ile şifreleme anahtarı verin.
 func SetUserInSession(w http.ResponseWriter, r *http.Request, user any) error {
-	s := getStore()
-	sess, err := s.Get(r, authSessionName)
+	sess, err := getSession(r, authSessionName)
 	if err != nil {
 		return err
 	}
+	delete(sess.Values, userKeyRaw)
 	if user == nil {
-		delete(sess.Values, "user")
-		delete(sess.Values, "userjson")
+		delete(sess.Values, userKeyJSON)
 		return sess.Save(r, w)
 	}
 	b, err := json.Marshal(user)
 	if err != nil {
-		// fallback to fmt.Sprint
-		sess.Values["user"] = fmt.Sprint(user)
-		return sess.Save(r, w)
+		return fmt.Errorf("web: user is not JSON-serialisable: %w", err)
 	}
-	sess.Values["userjson"] = string(b)
+	sess.Values[userKeyJSON] = string(b)
 	return sess.Save(r, w)
 }
 
-// GetUserFromRequest retrieves the user object from the auth session attached to the request.
-// Returns (user, true) if present. If stored as JSON, it returns a map[string]any for easy template usage.
+// GetUserFromRequest auth oturumundaki kullanıcıyı döner. JSON olarak saklandıysa
+// şablonlarda kolay kullanım için map[string]any döner.
 func GetUserFromRequest(r *http.Request) (any, bool) {
-	s := getStore()
-	sess, err := s.Get(r, authSessionName)
+	sess, err := getSession(r, authSessionName)
 	if err != nil {
 		return nil, false
 	}
-	if v, ok := sess.Values["user"]; ok {
-		return v, true
-	}
-	if v, ok := sess.Values["userjson"]; ok {
+	return userFromSession(sess)
+}
+
+func userFromSession(sess *sessions.Session) (any, bool) {
+	if v, ok := sess.Values[userKeyJSON]; ok {
 		if s0, ok := v.(string); ok {
 			var m map[string]any
 			if err := json.Unmarshal([]byte(s0), &m); err == nil {
 				return m, true
 			}
-			// return raw string if unmarshal fails
 			return s0, true
 		}
+	}
+	if v, ok := sess.Values[userKeyRaw]; ok && v != nil {
+		return v, true
 	}
 	return nil, false
 }
 
-// ClearUserFromSession removes the user from session (logout).
+// ClearUserFromSession kullanıcıyı oturumdan siler (logout).
 func ClearUserFromSession(w http.ResponseWriter, r *http.Request) error {
-	s := getStore()
-	sess, err := s.Get(r, authSessionName)
+	sess, err := getSession(r, authSessionName)
 	if err != nil {
 		return err
 	}
-	delete(sess.Values, "user")
-	delete(sess.Values, "userjson")
+	delete(sess.Values, userKeyRaw)
+	delete(sess.Values, userKeyJSON)
 	return sess.Save(r, w)
 }

@@ -1,126 +1,53 @@
+// Package strutil, pkg/text için geriye dönük uyumluluk sarmalayıcısıdır.
+// Tüm fonksiyonlar doğrudan github.com/mustafacaglarkara/webdev/pkg/text
+// paketine yönlendirilir; iki import yolu aynı sonucu verir.
+// Yeni kodda pkg/text kullanılması önerilir.
 package strutil
 
-import (
-	"html"
-	"path/filepath"
-	"regexp"
-	"strings"
-	"unicode"
-)
+import "github.com/mustafacaglarkara/webdev/pkg/text"
 
-// SplitAndTrim splits a comma-separated string, trims spaces and returns non-empty parts.
-// Returns nil for empty input (to preserve previous behavior).
-func SplitAndTrim(s string) []string {
-	if s == "" {
-		return nil
-	}
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
+// SplitAndTrim virgülle ayrılmış metni böler, parçaları kırpar ve boş
+// olmayanları döner; boş girdide nil döner. Bkz. text.SplitAndTrim.
+func SplitAndTrim(s string) []string { return text.SplitAndTrim(s) }
 
-// ToSlug dönüştürme: Türkçe karakterleri sadeleştirip a-z0-9 ve '-' biçimine çevirir.
-func ToSlug(s string) string {
-	s = strings.ToLower(s)
-	tr := map[string]string{"ç": "c", "ğ": "g", "ı": "i", "ö": "o", "ş": "s", "ü": "u"}
-	for k, v := range tr {
-		s = strings.ReplaceAll(s, k, v)
-	}
-	re := regexp.MustCompile(`[^a-z0-9]+`)
-	s = re.ReplaceAllString(s, "-")
-	return strings.Trim(s, "-")
-}
+// ToSlug metni URL dostu slug'a çevirir. Bkz. text.ToSlug.
+func ToSlug(s string) string { return text.ToSlug(s) }
 
-// ReverseString rune-safe ters çevirir.
-func ReverseString(s string) string {
-	r := []rune(s)
-	for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {
-		r[i], r[j] = r[j], r[i]
-	}
-	return string(r)
-}
+// ReverseString rune güvenli ters çevirir. Bkz. text.ReverseString.
+func ReverseString(s string) string { return text.ReverseString(s) }
 
-func ToUpper(s string) string { return strings.ToUpper(s) }
-func ToLower(s string) string { return strings.ToLower(s) }
+// ToUpper yerel ayardan bağımsız büyük harf. Bkz. text.ToUpper, text.ToUpperTR.
+func ToUpper(s string) string { return text.ToUpper(s) }
 
-// IsBlank: sadece whitespace ise true.
-func IsBlank(s string) bool {
-	for _, r := range s {
-		if !unicode.IsSpace(r) {
-			return false
-		}
-	}
-	return true
-}
+// ToLower yerel ayardan bağımsız küçük harf. Bkz. text.ToLower, text.ToLowerTR.
+func ToLower(s string) string { return text.ToLower(s) }
 
-// Coalesce: boş olmayan ilk string.
-func Coalesce(ss ...string) string {
-	for _, s := range ss {
-		if s != "" {
-			return s
-		}
-	}
-	return ""
-}
+// ToUpperTR Türkçe kurallarıyla büyük harf ("i" -> "İ"). Bkz. text.ToUpperTR.
+func ToUpperTR(s string) string { return text.ToUpperTR(s) }
 
-// Truncate: rune-safe keser.
-func Truncate(s string, n int) string {
-	if n <= 0 {
-		return ""
-	}
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[:n])
-}
+// ToLowerTR Türkçe kurallarıyla küçük harf ("I" -> "ı"). Bkz. text.ToLowerTR.
+func ToLowerTR(s string) string { return text.ToLowerTR(s) }
 
-// NormalizeSpace: çoklu boşlukları tek boşluğa indirger, kenarları kırpar.
-func NormalizeSpace(s string) string {
-	space := regexp.MustCompile(`\s+`)
-	return strings.TrimSpace(space.ReplaceAllString(s, " "))
-}
+// TitleTR Türkçe kurallarıyla kelime başlarını büyütür. Bkz. text.TitleTR.
+func TitleTR(s string) string { return text.TitleTR(s) }
 
-// UnescapeHTML: HTML entity'lerini gerçek karakterlere çözer.
-func UnescapeHTML(s string) string { return html.UnescapeString(s) }
+// IsBlank yalnızca boşluksa true. Bkz. text.IsBlank.
+func IsBlank(s string) bool { return text.IsBlank(s) }
 
-// FixTurkishMojibake: Yaygın Türkçe mojibake karakterlerini düzeltir.
-func FixTurkishMojibake(s string) string {
-	repls := map[string]string{
-		"ã¶": "ö", "Ã¶": "ö", "Ä±": "ı", "Ä°": "İ", "Ã¼": "ü",
-		"Ã§": "ç", "Ã": "Ö", "Ã": "Ç", "Ä": "ğ", "Ä": "Ğ",
-		"å": "ş", "Å": "Ş", "Â": "", "Ã": "Ü",
-	}
-	for k, v := range repls {
-		s = strings.ReplaceAll(s, k, v)
-	}
-	return s
-}
+// Coalesce boş olmayan ilk metin. Bkz. text.Coalesce.
+func Coalesce(ss ...string) string { return text.Coalesce(ss...) }
 
-// ToSlugForFile: Dosya adları için güvenli slug üretir.
-func ToSlugForFile(name string) string {
-	if name == "" {
-		return ""
-	}
-	// Ayır: sadece son uzantıyı koru
-	ext := strings.ToLower(filepath.Ext(name))
-	base := name[:len(name)-len(ext)]
-	base = strings.ToLower(base)
-	tr := map[string]string{"ç": "c", "ğ": "g", "ı": "i", "ö": "o", "ş": "s", "ü": "u"}
-	for k, v := range tr {
-		base = strings.ReplaceAll(base, k, v)
-	}
-	re := regexp.MustCompile(`[^a-z0-9]+`)
-	base = re.ReplaceAllString(base, "-")
-	base = strings.Trim(base, "-")
-	if ext != "" {
-		return base + ext
-	}
-	return base
-}
+// Truncate rune güvenli keser. Bkz. text.Truncate.
+func Truncate(s string, n int) string { return text.Truncate(s, n) }
+
+// NormalizeSpace ardışık boşlukları teke indirir ve kırpar. Bkz. text.NormalizeSpace.
+func NormalizeSpace(s string) string { return text.NormalizeSpace(s) }
+
+// UnescapeHTML HTML entity'lerini çözer. Bkz. text.UnescapeHTML.
+func UnescapeHTML(s string) string { return text.UnescapeHTML(s) }
+
+// FixTurkishMojibake bozuk kodlanmış Türkçe metni onarır. Bkz. text.FixTurkishMojibake.
+func FixTurkishMojibake(s string) string { return text.FixTurkishMojibake(s) }
+
+// ToSlugForFile güvenli dosya adı üretir. Bkz. text.ToSlugForFile.
+func ToSlugForFile(name string) string { return text.ToSlugForFile(name) }

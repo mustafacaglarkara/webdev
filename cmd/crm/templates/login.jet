@@ -1,0 +1,15 @@
+<section class="narrow">
+  <h1>{{ t(ctx, "login.title") }}</h1>
+  <form method="post" action="{{ route("auth.login") }}" class="form" novalidate>
+    <input type="hidden" name="csrf_token" value="{{ CSRFToken }}">
+    <input type="hidden" name="next" value="{{ Next }}">
+    <label for="username">{{ t(ctx, "login.username") }}</label>
+    <input id="username" name="username" autocomplete="username" required maxlength="64" value="{{ old(ctx, "username") }}">
+    <label for="password">{{ t(ctx, "login.password") }}</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="128">
+    <button type="submit">{{ t(ctx, "login.submit") }}</button>
+  </form>
+  {{- if !IsProduction }}
+  <p class="muted">{{ t(ctx, "login.demo_hint") }}</p>
+  {{- end }}
+</section>

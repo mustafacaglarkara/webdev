@@ -1,106 +1,111 @@
-# security
-
-CSRF, XSS, Clickjacking gibi güvenlik katmanları için yardımcılar. Django/Laravel'deki gibi varsayılan koruma sağlar. Hem handler seviyesinde hem de global middleware olarak kullanılabilir.
-
-## 1. CSRF Koruması (gorilla/csrf)
-
-### Temel Middleware Kullanımı
+# pkg/security — HTML temizleme, CSRF çekirdeği, güvenlik başlıkları
 
 ```go
-import (
-    "net/http"
-    "github.com/gorilla/csrf"
-    "your/module/path/pkg/security"
-)
-
-mux := http.NewServeMux()
-mux.HandleFunc("/form", func(w http.ResponseWriter, r *http.Request) {
-    // CSRF token'ı şablona veya JSON'a ekleyin
-    token := csrf.Token(r)
-    w.Write([]byte("<input type='hidden' name='csrf_token' value='" + token + "'>"))
-})
-
-app := security.CSRFMiddleware([]byte("32-byte-long-auth-key"))(mux)
-http.ListenAndServe(":8080", app)
+import "github.com/mustafacaglarkara/webdev/pkg/security"
 ```
 
-### Custom Error Handler ve Token Header
+Yalnızca `net/http` + gorilla/csrf / unrolled/secure kullanır. Projedeki **tek** CSRF doğrulama
+çekirdeği buradadır; `pkg/web` ve `pkg/web/fiberweb` onu kullanır. HTML temizlemenin tek
+uygulaması [`pkg/text`](../text/README.md) içindedir; buradaki `SanitizeHTML*` fonksiyonları ona
+yönlenir, dolayısıyla iki paket her zaman aynı sonucu verir.
+
+## 1. HTML temizleme (XSS)
 
 ```go
-app := security.CSRFMiddleware(
-    []byte("32-byte-long-auth-key"),
-    csrf.ErrorHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        http.Error(w, "CSRF doğrulama hatası", 403)
-    })),
-    csrf.RequestHeader("X-CSRF-Token"),
-)
+safe := security.SanitizeHTML(`<script>x</script><b onclick="y()">Merhaba</b>`) // "<b>Merhaba</b>"
+text := security.SanitizeHTMLStrict("<b>bold</b>")                               // "bold"
+out := security.SanitizeHTMLMode(input, "strict") // "" / "ugc" / "relaxed" → UGC, diğer her şey → strict
 ```
 
-### Edge-Case: Eksik veya Hatalı Token
-- POST/PUT/DELETE isteklerinde token eksikse veya yanlışsa 403 döner.
-- GET isteklerinde token otomatik üretilir, şablona veya response'a eklenmelidir.
+Politikalar (`bluemonday.UGCPolicy`, `bluemonday.StrictPolicy`) `pkg/text` içinde paket düzeyinde
+bir kez kurulur ve eşzamanlı kullanım için güvenlidir. Özel politika gerekiyorsa
+`text.SanitizeHTMLWith` kullanın. Şablonlardaki `sanitize` filtresi
+(`web.JetTemplateFilters`) da bunu kullanır.
 
----
+## 2. CSRF — oturum tabanlı çekirdek (önerilen)
 
-## 2. XSS Koruması (bluemonday)
-
-### Kullanıcı Girdisini Temizleme
+Token'ın nerede saklandığı `CSRFStore` ile soyutlanır:
 
 ```go
-import "your/module/path/pkg/security"
-
-unsafe := "<script>alert('x')</script><b>Merhaba</b>"
-safe := security.SanitizeHTML(unsafe) // "<b>Merhaba</b>"
+type CSRFStore interface {
+    Token(w http.ResponseWriter, r *http.Request) (string, error) // al veya üret+sakla
+    Expected(r *http.Request) (string, error)                     // saklı token ("" olabilir)
+}
 ```
 
-### Farklı Policy ile Temizleme
+`pkg/web` gorilla/sessions çerezi ile bir store sağlar (`web.CSRFStore()`), dolayısıyla çoğu
+uygulama doğrudan şunları kullanır:
+
+- net/http: `web.CSRFMiddleware(&security.CSRFOptions{...})` (= `security.CSRFProtect(web.CSRFStore(), ...)`)
+- fiber: `fiberweb.CSRF()` / `fiberweb.CSRFWithConfig(...)`
+
+Her ikisi aynı `session-csrf` çerezini ve aynı token'ı paylaşır.
 
 ```go
-import "github.com/microcosm-cc/bluemonday"
-custom := bluemonday.StrictPolicy().Sanitize("<b>bold</b>") // "bold"
+h := security.CSRFProtect(store, &security.CSRFOptions{
+    SkipPaths:    []string{"/api/*"},
+    Skip:         func(r *http.Request) bool { return r.Header.Get("Authorization") != "" },
+    ErrorHandler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        http.Error(w, "CSRF: "+security.CSRFError(r).Error(), http.StatusForbidden)
+    }),
+})(mux)
+
+// handler içinde
+tok := security.CSRFTokenFromContext(r.Context())
 ```
 
-### Edge-Case: Boş veya sadece script içeren input
-- Sadece script: "<script>...</script>" → ""
-- Boş string: "" → ""
+| Sembol | Açıklama |
+|---|---|
+| `CSRFProtect(store, *CSRFOptions)` | Güvenli olmayan metotlarda token zorunlu; store hatası/eksik/yanlış token → 403. |
+| `VerifyCSRF(store, r, provided) error` | `ErrCSRFMissing`, `ErrCSRFInvalid` veya store hatası. |
+| `CSRFTokensEqual(expected, provided) bool` | `crypto/subtle` ile sabit zamanlı; boş token asla eşleşmez. |
+| `NewCSRFToken() (string, error)` | 32 bayt rastgele, hex. |
+| `IsCSRFSafeMethod(method) bool` | GET/HEAD/OPTIONS/TRACE. |
+| `CSRFProvidedToken(r) string` | Önce `X-CSRF-Token`, sonra `csrf_token` form alanı. |
+| `CSRFTokenFromContext(ctx)`, `CSRFError(r)` | |
+| `MatchPath(pattern, path) bool` | Tam eşleşme veya `/api/*` önek deseni. |
+| `CSRFHeaderName`, `CSRFFieldName` | `"X-CSRF-Token"`, `"csrf_token"`. |
 
----
+### Hangisini ne zaman?
 
-## 3. Clickjacking ve Güvenlik Header'ları (unrolled/secure)
+| | `web.CSRFMiddleware` / `fiberweb.CSRF` (oturum çekirdeği) | `security.CSRFMiddleware` (gorilla/csrf, **Deprecated**) |
+|---|---|---|
+| Token deposu | `pkg/web` oturum çerezi (`session-csrf`) | gorilla/csrf'in kendi `_gorilla_csrf` çerezi |
+| Fiber desteği | Var (aynı token) | Yok |
+| Form alanı / başlık | `csrf_token` / `X-CSRF-Token` | `gorilla.csrf.Token` / `X-CSRF-Token` (`csrf.Token(r)`) |
+| Ne zaman | pkg/web oturumlarını kullanan tüm uygulamalar | Yalnızca pkg/web kullanmayan, zaten gorilla/csrf'e bağlı eski net/http kodu |
 
-### Middleware ile Header Ekleme
+İki mekanizmanın token'ları **birbiriyle uyumlu değildir**; aynı uygulamada ikisini birlikte
+kullanmayın.
+
+## 3. Güvenlik başlıkları
 
 ```go
-import (
-    "github.com/unrolled/secure"
-    "your/module/path/pkg/security"
-)
+h := security.SecureHeaders()(mux) // güvenli varsayılanlar
 
-secureMW := security.SecureHeaders(secure.Options{
-    FrameDeny: true,
-    ContentTypeNosniff: true,
-    BrowserXssFilter: true,
-    SSLRedirect: true,
-    SSLProxyHeaders: map[string]string{"X-Forwarded-Proto": "https"},
-})
-
-app := secureMW(router)
+opts := security.DefaultSecureOptions()
+opts.ContentSecurityPolicy = "default-src 'self'; frame-ancestors 'none'"
+opts.IsDevelopment = true // yerelde HSTS/SSL kontrollerini kapatır
+h = security.SecureHeaders(opts)(mux)
 ```
 
-### Edge-Case: SSLRedirect aktifse, HTTP istekleri otomatik HTTPS'e yönlendirilir.
+`DefaultSecureOptions()`: `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: strict-origin-when-cross-origin`, HSTS 2 yıl + includeSubDomains (yalnızca
+HTTPS'te), CSP `object-src 'none'; base-uri 'self'; frame-ancestors 'none'`.
 
----
+## Güvenlik notları
 
-## 4. Test ve Gelişmiş Senaryolar
+- CSRF fail-closed'dır: store yoksa/okunamazsa veya token yoksa güvenli olmayan istekler reddedilir.
+- Token karşılaştırması sabit zamanlıdır.
+- Varsayılan CSP inline script'leri kırmamak için asgaridir; kendi `default-src`/`script-src`
+  politikanızı eklemeniz önerilir.
+- `SanitizeHTMLMode` bilinmeyen modda en katı politikayı uygular.
 
-- CSRF token'ı şablon, JSON veya header ile istemciye iletebilirsiniz.
-- XSS temizleme, kullanıcıdan gelen tüm HTML inputlarda uygulanmalı.
-- Güvenlik header'ları, tüm handler zincirinin en dışına eklenmeli.
-- CSRF anahtarı production ortamında güçlü ve gizli olmalı.
+## Geçiş notu
 
----
-
-## Notlar
-- Tüm fonksiyonlar thread-safe'dir.
-- CSRF, XSS ve header korumaları birlikte zincirlenebilir.
-- Daha fazla detay ve gelişmiş kullanım için ilgili paketlerin dökümantasyonuna bakınız.
+- `SecureHeaders(opts secure.Options)` → `SecureHeaders(opts ...secure.Options)`; mevcut çağrılar
+  derlenmeye devam eder, argümansız çağrı güvenli varsayılanları kullanır.
+- `CSRFMiddleware` (gorilla/csrf) **Deprecated**; yerine `web.CSRFMiddleware` / `fiberweb.CSRF`.
+- `pkg/web`'deki eski `bluemonday` politikaları kaldırıldı; `sanitize` filtresi artık bu paketi kullanır.
+- Yeni: `SanitizeHTMLStrict`, `SanitizeHTMLMode`, `CSRFProtect`, `CSRFStore`, `VerifyCSRF`,
+  `CSRFTokensEqual`, `NewCSRFToken`, `DefaultSecureOptions` ve diğer CSRF yardımcıları.

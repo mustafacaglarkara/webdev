@@ -1,174 +1,131 @@
 # sqlutil
 
-SQL işlemleri için yardımcı fonksiyonlar içerir. Sorgu oluşturma, SQL template'leriyle dinamik sorgu üretimi ve veri işleme işlemlerinde kullanılır.
-
-## Temel Kullanım
-
-### SQLLoader ile Dosyadan SQL Yükleme
+`text/template` tabanlı SQL dosyası yükleyicisi ve SQL tanımlayıcı/diyalekt yardımcıları.
 
 ```go
-import (
-    "embed"
-    "fmt"
-    "your/module/path/pkg/sqlutil"
-)
+import "github.com/mustafacaglarkara/webdev/pkg/sqlutil"
+```
 
-//go:embed queries/*.sql
+## Güvenlik kuralları (önce bunu okuyun)
+
+- **Değerler SQL metnine asla yazılmaz.** Şablonda değer için `{{ param .x }}`,
+  `{{ in .xs }}`, `{{ inList "kolon" .xs }}`, `{{ setList .m }}` kullanın ve şablonu
+  **`Render` / `RenderNamed`** ile çalıştırın. Bunlar `(sql, args, err)` döner.
+- `{{ .x }}` ile doğrudan yazılan her şey SQL metnine aynen girer ve **SQL enjeksiyonuna
+  açıktır**. Bunu yalnızca güvenilir, sabit metinler için kullanın; değer için asla.
+- **Tanımlayıcılar** (tablo/kolon adı) için `{{ ident .col }}` / `{{ idents .cols }}`
+  kullanın: katı kalıpla doğrulanır, diyalekte göre tırnaklanır; geçersizse şablon hata verir.
+- `inList`, `notInList`, `setList` anahtarları, `spOut*` parametre adları, tipleri ve takma
+  adları da doğrulanır.
+- `whereJoin` / `andJoin` / `orJoin`, `join` gibi fonksiyonlar verilen **SQL parçalarını**
+  birleştirir; bu parçalar kullanıcı değeri içermemelidir.
+- `Load` / `LoadNamed` (eski API) değer içeren sorgular için **güvensizdir** ve Deprecated'dır;
+  bu modda `param` / `in` hata verir (`ErrBindOnly`).
+
+## Diyalekt ve tanımlayıcılar
+
+```go
+d, _ := sqlutil.ParseDialect("pg")                   // sqlutil.Postgres
+q, err := sqlutil.QuoteIdent(sqlutil.MySQL, "db.users") // `db`.`users`
+err = sqlutil.ValidateIdent("users; DROP")           // ErrInvalidIdentifier
+ph := sqlutil.Placeholder(sqlutil.SQLServer, 2)      // @p2
+d = sqlutil.DetectDialect(sqlDB)                     // *sql.DB sürücüsünden
+```
+
+| Diyalekt | Tanımlayıcı | Yer tutucu |
+|---|---|---|
+| `Postgres` | `"şema"."tablo"` | `$1, $2` |
+| `SQLite` | `"tablo"` | `?` |
+| `MySQL` | `` `tablo` `` | `?` |
+| `SQLServer` | `[tablo]` | `@p1, @p2` |
+| `Generic` (varsayılan) | `tablo` (yalnızca doğrulama) | `?` |
+
+Tanımlayıcı kalıbı: her parça `^[A-Za-z_][A-Za-z0-9_]{0,127}$`, en fazla üç noktalı parça.
+
+## Parametreli şablonlar (Render)
+
+`queries/users.sql`:
+
+```sql
+-- name: byID
+SELECT id, name FROM {{ ident .table }} WHERE id = {{ param .id }};
+
+-- name: search
+SELECT id, name FROM users
+WHERE {{ inList "status" .statuses }}{{ if .name }} AND name LIKE {{ param .name }}{{ end }}
+ORDER BY {{ ident .orderBy }};
+
+-- name: update
+UPDATE users {{ setList .fields }} WHERE id = {{ param .id }};
+```
+
+```go
+//go:embed queries
 var queries embed.FS
 
-func main() {
-    loader := sqlutil.NewSQLLoader(queries, nil)
-    sql, err := loader.Load("queries/user_by_id.sql", map[string]any{"id": 42})
-    if err != nil {
-        panic(err)
-    }
-    fmt.Println(sql)
-}
+loader := sqlutil.NewSQLLoader(queries, nil, sqlutil.WithDialect(sqlutil.Postgres))
+
+sql, args, err := loader.RenderNamed("queries/users.sql", "search", map[string]any{
+	"statuses": []string{"active", "pending"},
+	"name":     "%ali%",
+	"orderBy":  "created_at",
+})
+// sql:  SELECT id, name FROM users
+//       WHERE "status" IN ($1, $2) AND name LIKE $3
+//       ORDER BY "created_at";
+// args: ["active", "pending", "%ali%"]
+rows, err := db.QueryContext(ctx, sql, args...)
 ```
 
-`queries/user_by_id.sql` içeriği örneği:
+Tek sorgulu dosyalar için `loader.Render("queries/by_id.sql", data)`.
+
+GORM ile: GORM `?` bekler; `WithDialect` vermeden (Generic) render edip
+`gormDB.Raw(sql, args...)` kullanın.
+
+### Şablon fonksiyonları
+
+| Fonksiyon | Render çıktısı | Not |
+|---|---|---|
+| `param v` | `$1` / `@p1` / `?` | argümanı toplar |
+| `in xs` | `($1, $2)` | parantez dahil; boş liste hata verir |
+| `inList "kolon" xs` | `"kolon" IN ($1, $2)`, tek eleman `"kolon" = $1`, boş/nil `1=0` | |
+| `notInList "kolon" xs` | `"kolon" NOT IN (...)`, tek `<>`, boş `1=1` | |
+| `setList m` | `SET "a" = $1, "b" = $2` (anahtar sıralı) | anahtarlar doğrulanır |
+| `ident s`, `idents xs` | tırnaklanmış tanımlayıcı(lar) | |
+| `spOutDecl n t`, `spOutVal n`, `spOutDecls xs`, `spOutVals xs` | SQL Server OUT parametreleri | ad/tip/alias doğrulanır |
+| `whereJoin sep parts...`, `andJoin`, `orJoin` | `WHERE a AND b` | yalnızca güvenilir parçalar |
+| `list`, `dict`, `join`, `upper`, `lower`, `trim`, `title` | genel | |
+
+Aynı yer tutucuyu iki kez yazdırmak için `param`'ı iki kez çağırın (`?` diyalektlerinde
+her kullanım ayrı argüman gerektirir).
+
+### SQL Server OUT parametreleri
+
 ```sql
-SELECT * FROM users WHERE id = {{.id}};
-```
-
-Çıktı:
-```
-SELECT * FROM users WHERE id = 42;
-```
-
----
-
-## Çoklu Sorgu: LoadNamed ile Tek Dosyada Birden Fazla Sorgu
-
-Bir dosyada birden fazla sorgu tutmak için her sorgunun başına `-- name: sorguAdi` ekleyin:
-
-`queries/product.sql`:
-```sql
--- name: getProductById
-SELECT * FROM product WHERE id = {{.id}};
-
--- name: listProducts
-SELECT * FROM product WHERE status = {{.status}};
-```
-
-Kullanım:
-```go
-sql, err := loader.LoadNamed("queries/product.sql", "getProductById", map[string]any{"id": 5})
-// sql: SELECT * FROM product WHERE id = 5;
-
-sql, err := loader.LoadNamed("queries/product.sql", "listProducts", map[string]any{"status": "active"})
-// sql: SELECT * FROM product WHERE status = 'active';
-```
-
----
-
-## Otomatik OUT Parametre Toplama (SQL Server)
-
-Stored procedure OUT parametrelerini tek yerde tanımlayıp EXEC ve SELECT bölümlerini otomatik üretebilirsiniz. Kullanılan template fonksiyonları: `list`, `dict`, `spOutDecls`, `spOutVals`.
-
-Örnek template:
-```sql
-{{ $outs := list (dict "name" "o_id" "type" "INT" "alias" "id") (dict "name" "o_msg" "type" "NVARCHAR(100)" "alias" "message") }}
+{{ $outs := list (dict "name" "o_id" "type" "INT" "alias" "id") (dict "name" "o_msg" "type" "NVARCHAR(100)") }}
 EXEC MyProc {{ spOutDecls $outs }};
 SELECT {{ spOutVals $outs }};
+-- EXEC MyProc @o_id INT OUTPUT, @o_msg NVARCHAR(100) OUTPUT;
+-- SELECT @o_id AS id, @o_msg AS o_msg;
 ```
 
-Açıklama:
-- `list`: Elemanlardan slice oluşturur.
-- `dict`: key/value çiftlerinden map oluşturur (name, type, alias).
-- `spOutDecls`: EXEC çağrısı için `@name TYPE OUTPUT` listesini üretir.
-- `spOutVals`: SELECT için `@name AS alias` listesini üretir; alias boş ise `name`'in `@` işareti atılmış hali kullanılır.
+Desteklenen girdiler: `[]map[string]any`, `[]map[string]string`, `[]struct{Name, Type, Alias string}`.
+Tip kalıbı: `INT`, `NVARCHAR(100)`, `NVARCHAR(MAX)`, `DECIMAL(18, 2)` gibi.
 
-Desteklenen veri tipleri:
-- `[]map[string]any`, `[]map[string]string` veya `[]struct{Name,Type,Alias string}`.
+## Diğer yöntemler
 
----
+- `NewSQLLoader(fsys, funcs, opts...)`: `funcs` varsayılanların üzerine eklenir; çağıranın map'i değiştirilmez.
+- `PreloadDir(dir)`: dizindeki tüm `.sql` dosyalarını önceden parse eder.
+- `LoadRaw(name)`: dosyayı işlemeden okur.
+- `Dialect()`: yükleyicinin diyalekti.
+- Yollar okunmadan önce `fs.ValidPath` ile doğrulanır (`..`, mutlak yol, `\` reddedilir).
+- `LoadNamed` / `RenderNamed` dosyayı bir kez parse edip cache'ler. Yükleyici eşzamanlı kullanım için güvenlidir.
 
-## GORM ile Kullanım
-
-sqlutil ile üretilen SQL sorgularını GORM ile kullanabilirsiniz:
+## Eski API (Deprecated)
 
 ```go
-import (
-    "gorm.io/gorm"
-    "your/module/path/pkg/sqlutil"
-)
-
-var result []Product
-sql, err := loader.LoadNamed("queries/product.sql", "getProductById", map[string]any{"id": 1})
-if err != nil {
-    panic(err)
-}
-err = db.Raw(sql).Scan(&result).Error
+sql, err := loader.Load("queries/x.sql", data)             // GÜVENSİZ: değerler metne yazılır
+sql, err = loader.LoadNamed("queries/x.sql", "byID", data)  // GÜVENSİZ
 ```
 
-Aynı şekilde, parametreli sorgularda da GORM'un Raw/Exec fonksiyonlarını kullanabilirsiniz.
-
----
-
-## Template Fonksiyonları ile Dinamik Sorgular
-
-### join, upper, lower, trim, title
-```sql
-SELECT {{ join "," .fields }} FROM users;
--- .fields = ["id", "name", "email"]
-```
-
-### whereJoin, andJoin, orJoin
-```sql
-SELECT * FROM users {{ whereJoin "AND" .cond1 .cond2 }};
--- .cond1 = "name = ?", .cond2 = "age > ?"
--- Sonuç: WHERE name = ? AND age > ?
-```
-
-### inList
-```sql
-SELECT * FROM users WHERE {{ inList "id" .ids }};
--- .ids = [1,2,3]
--- Sonuç: id IN (?,?,?)
-```
-
-### setList
-```sql
-UPDATE users {{ setList .fields }} WHERE id = ?;
--- .fields = map[string]any{"name": "Ali", "email": "ali@example.com"}
--- Sonuç: SET email=?, name=?
-```
-
----
-
-## PreloadDir ile Tüm SQL'leri Önden Parse Etme
-
-```go
-err := loader.PreloadDir("queries")
-if err != nil {
-    panic(err)
-}
-```
-
----
-
-## LoadRaw ile Ham SQL Okuma
-
-```go
-raw, err := loader.LoadRaw("queries/raw.sql")
-```
-
----
-
-## Hata Yönetimi
-
-- Sorgu adı bulunamazsa: `sorgu bulunamadı: ...` hatası döner.
-- Eksik parametre veya hatalı template: Go template hatası döner.
-- Geçersiz dosya yolu: `invalid template path` hatası döner.
-
----
-
-## Notlar
-- SQL template'leri Go text/template ile çalışır, fonksiyonlar otomatik eklenir.
-- Parametreler map veya struct olarak verilebilir.
-- PreloadDir ile tüm SQL'ler baştan parse edilip cache'lenir.
-- inList, setList gibi fonksiyonlar edge-case'lerde güvenli sonuç döner.
-- Otomatik OUT parametre toplama için `spOutDecls` ve `spOutVals` fonksiyonlarını kullanın.
-- sqlutil ile üretilen SQL'ler GORM ile doğrudan kullanılabilir.
-- Daha fazla detay için kodu ve testleri inceleyin.
+Bu modda `inList` / `setList` yalnızca `?` üretir; argümanları çağıran sağlar.

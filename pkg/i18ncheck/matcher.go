@@ -90,9 +90,11 @@ func (m *GitignoreMatcher) Match(rel string, isDir bool) bool {
 	return ignored
 }
 
+// matchDoublestar rel'i (her zaman "/" ayraçlı) desenle eşleştirir.
+// doublestar.Match her platformda "/" ayracını kullanır; PathMatch Windows'ta
+// "\\" beklediği için "/" ile normalize edilmiş yollarda yanlış sonuç verirdi.
 func matchDoublestar(pattern, rel string) bool {
-	// doublestar PathMatch returns (bool, error)
-	ok, err := doublestar.PathMatch(pattern, rel)
+	ok, err := doublestar.Match(pattern, rel)
 	return err == nil && ok
 }
 

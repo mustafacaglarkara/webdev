@@ -18,7 +18,6 @@ func RegisterMuxRoutes(r *mux.Router) error {
 			return nil
 		}
 		RegisterRoute(name, path)
-		RegisterTemplate(name, path)
 		return nil
 	})
 }

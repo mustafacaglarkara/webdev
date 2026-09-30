@@ -1,7 +1,15 @@
+// Command demo, pkg/migrate ve pkg/crypto kullanımını gösteren küçük bir örnektir.
+//
+// Migration dosyaları ikiliye gömülüdür; bu yüzden komut herhangi bir dizinden
+// çalıştırılabilir. Veritabanı varsayılan olarak geçici bir dizinde oluşturulur
+// ve çıkışta silinir; saklamak için -db ile bir yol verin.
 package main
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"embed"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -13,41 +21,66 @@ import (
 	"github.com/mustafacaglarkara/webdev/pkg/migrate"
 )
 
-func main() {
-	// demo.db'yi temizle
-	dbFile := "demo.db"
-	_ = os.Remove(dbFile)
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
 
-	sqlDB, err := sql.Open("sqlite3", dbFile)
+func main() {
+	dbPath := flag.String("db", "", "SQLite dosya yolu (boşsa geçici dosya kullanılır ve çıkışta silinir)")
+	flag.Parse()
+
+	if err := run(*dbPath); err != nil {
+		log.Fatalf("demo: %v", err)
+	}
+}
+
+func run(dbPath string) error {
+	if dbPath == "" {
+		dir, err := os.MkdirTemp("", "webdev-demo-*")
+		if err != nil {
+			return fmt.Errorf("geçici dizin: %w", err)
+		}
+		defer os.RemoveAll(dir)
+		dbPath = filepath.Join(dir, "demo.db")
+	}
+
+	sqlDB, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
-		log.Fatalf("db open: %v", err)
+		return fmt.Errorf("db open: %w", err)
 	}
 	defer sqlDB.Close()
 
-	migrationsDir := filepath.Join("cmd", "demo", "migrations")
-	fmt.Println("Running migrations from:", migrationsDir)
-	if err := migrate.Migrate(sqlDB, migrationsDir); err != nil {
-		log.Fatalf("migrate err: %v", err)
+	// Yalnızca bekleyen migration'lar çalışır; tekrar çalıştırmak güvenlidir.
+	if err := migrate.MigrateFS(sqlDB, migrationsFS, "migrations"); err != nil {
+		return fmt.Errorf("migrate: %w", err)
 	}
 
-	// basit sorgu
-	r := sqlDB.QueryRow("SELECT COUNT(1) FROM users")
 	var cnt int
-	if err := r.Scan(&cnt); err != nil {
-		log.Fatalf("scan: %v", err)
+	if err := sqlDB.QueryRow("SELECT COUNT(1) FROM users").Scan(&cnt); err != nil {
+		return fmt.Errorf("scan: %w", err)
 	}
+	fmt.Println("db:", dbPath)
 	fmt.Println("users count:", cnt)
 
-	// token demo
-	tok, _ := crypto.GenerateBearerTokenFromCredentials("alice", "s3cr3t", crypto.WithHMACKey("demo-hmac"), crypto.WithPrefix("Bearer"))
-	fmt.Println("Generated token:", tok)
+	// İmzalı token: parola taşımaz, süresi zorunludur.
+	key := make([]byte, crypto.MinSignedTokenKeyLen)
+	if _, err := rand.Read(key); err != nil {
+		return fmt.Errorf("anahtar üretimi: %w", err)
+	}
+	tok, err := crypto.GenerateSignedToken(key, "alice", map[string]any{"role": "admin"}, 15*time.Minute)
+	if err != nil {
+		return fmt.Errorf("token üretimi: %w", err)
+	}
+	fmt.Println("signed token:", tok)
 
-	// basic bearer
-	fmt.Println("Basic bearer:", crypto.GenerateBasicBearer("bob", "pwd"))
+	claims, err := crypto.ParseSignedToken(tok, key)
+	if err != nil {
+		return fmt.Errorf("token doğrulama: %w", err)
+	}
+	fmt.Printf("verified claims: %+v\n", *claims)
 
-	// keep demo.db for inspection
-	fmt.Println("demo finished, db file:", dbFile, "(you can open it with sqlite3)")
-	_ = os.Chmod(dbFile, 0644)
-	// brief sleep so logs flush
-	time.Sleep(100 * time.Millisecond)
+	// Değiştirilmiş token reddedilir.
+	if _, err := crypto.ParseSignedToken(tok+"x", key); err != nil {
+		fmt.Println("tampered token rejected:", err)
+	}
+	return nil
 }

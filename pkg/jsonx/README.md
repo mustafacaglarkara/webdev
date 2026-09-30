@@ -1,60 +1,55 @@
 # jsonx
 
-JSON işlemleri için yardımcı fonksiyonlar içerir. JSON serileştirme, ayrıştırma, dosyaya yazma/okuma ve pretty-print işlemlerinde kullanılır.
-
-## Fonksiyonlar ve Kullanım Örnekleri
-
-### ToJSON
-Bir değeri JSON string'e çevirir.
 ```go
-package main
-import (
-    "fmt"
-    "your/module/path/pkg/jsonx"
-)
-func main() {
-    v := map[string]any{"ad": "Ahmet", "yas": 30}
-    s, err := jsonx.ToJSON(v)
-    if err != nil {
-        panic(err)
-    }
-    fmt.Println(s) // {"ad":"Ahmet","yas":30}
-}
+import "github.com/mustafacaglarkara/webdev/pkg/jsonx"
 ```
 
-### ToPrettyJSON
-Bir değeri girintili (pretty) JSON string'e çevirir.
+JSON serileştirme ve dosya okuma/yazma yardımcıları. Örnek çıktıları
+`example_test.go` ile doğrulanır.
+
+## ToJSON / ToPrettyJSON / FromJSON
+
 ```go
-s, _ := jsonx.ToPrettyJSON(map[string]int{"a": 1, "b": 2})
+s, _ := jsonx.ToJSON(map[string]any{"ad": "Ahmet", "yas": 30})
+fmt.Println(s) // {"ad":"Ahmet","yas":30}
+
+p, _ := jsonx.ToPrettyJSON(map[string]int{"a": 1, "b": 2})
+fmt.Println(p)
 // {
 //   "a": 1,
 //   "b": 2
 // }
+
+type Kisi struct {
+    Ad  string `json:"ad"`
+    Yas int    `json:"yas"`
+}
+k, err := jsonx.FromJSON[Kisi](`{"ad":"Ayşe","yas":25}`)
+fmt.Println(k.Ad, k.Yas, err) // Ayşe 25 <nil>
 ```
 
-### FromJSON
-Bir JSON string'i struct veya map'e çevirir.
-```go
-var out map[string]any
-out, err := jsonx.FromJSON[map[string]any]('{"ad":"Ayşe","yas":25}')
-// out["ad"] == "Ayşe"
-```
+## Dosya işlemleri
 
-### WriteJSONFile
-Bir değeri JSON olarak dosyaya yazar. pretty=true ile girintili yazar.
 ```go
+// 0644 izinleriyle atomik yazım; pretty=true girintili yazar.
 err := jsonx.WriteJSONFile("veri.json", map[string]int{"x": 5}, true)
+
+// Gizli veriler için 0600.
+err = jsonx.WriteJSONFileMode("gizli.json", Kisi{"Şule", 40}, true, 0o600)
+
+k, err := jsonx.ReadJSONFile[Kisi]("gizli.json")
+fmt.Println(k, err) // {Şule 40} <nil>
 ```
 
-### ReadJSONFile
-Bir JSON dosyasını struct veya map olarak okur.
-```go
-var m map[string]int
-m, err := jsonx.ReadJSONFile[map[string]int]("veri.json")
-```
+Yazım atomiktir: veri aynı dizinde geçici bir dosyaya yazılır, diske
+senkronlanır ve `rename` ile hedefin yerine konur. Serileştirme veya yazma
+hatasında mevcut dosya bozulmaz, geçici dosya silinir.
 
-## Notlar
-- Tüm fonksiyonlar generic olarak çalışır (Go 1.18+ gerektirir).
-- Dosya işlemlerinde hata kontrolü yapılmalıdır.
-- JSON string'ler UTF-8 olmalıdır.
-- Daha fazla detay için kodu inceleyebilirsiniz.
+Notlar:
+
+- Hedef dosya zaten varsa izinleri verilen `perm` olur (`WriteJSONFile` için
+  0644); eski izinler korunmaz.
+- Hedef bir sembolik bağlantıysa bağlantının kendisi normal dosyayla
+  değiştirilir (bağlantının gösterdiği dosyaya yazılmaz).
+- Token, kimlik bilgisi gibi gizli veriler için `WriteJSONFileMode(..., 0o600)`
+  kullanın.

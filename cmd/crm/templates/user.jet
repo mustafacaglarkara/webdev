@@ -1,0 +1,13 @@
+<section>
+  <h1>{{ t(ctx, "user.title") }}</h1>
+  <dl class="props">
+    <dt>{{ t(ctx, "user.name") }}</dt><dd>{{ UserName }}</dd>
+    <dt>{{ t(ctx, "user.username") }}</dt><dd>{{ Username }}</dd>
+    <dt>{{ t(ctx, "user.role") }}</dt><dd>{{ UserRole }}</dd>
+    <dt>{{ t(ctx, "user.lang") }}</dt><dd>{{ Lang }}</dd>
+  </dl>
+  <p class="muted">{{ t(ctx, "user.api_hint") }} <a href="{{ route("api.me") }}"><code>{{ route("api.me") }}</code></a></p>
+  {{- if !can(ctx, "/admin", "GET") }}
+  <p class="note">{{ t(ctx, "user.no_admin") }}</p>
+  {{- end }}
+</section>

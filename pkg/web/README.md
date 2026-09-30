@@ -1,390 +1,224 @@
-# pkg/web — HTTP/Fiber adaptörleri, Flash/Old ve Template Yardımcıları
+# pkg/web — net/http oturum, flash, old input, CSRF ve şablon yardımcıları
 
-Bu paket workspace içinde `pkg/web` altında bulunan HTTP/Fiber adaptörlü yardımcı fonksiyonları açıklar. Amacımız Laravel/Django'daki kolaylıkları Go + Fiber + Jet kombinasyonu ile sağlamaktır.
+```go
+import "github.com/mustafacaglarkara/webdev/pkg/web"
+```
 
-Öne çıkan başlıklar
-- Flash ve Old Inputs yardımcıları (mevcut)
-- Template filtreleri (JetTemplateFilters)
-- Form helper'ları (JetFormHelpers)
-- Fiber form bind yardımcıları (FiberForm, FiberJSONForm)
-- Jet Global Helper'lar (JetGlobalHelpers) — route, tag, dict, static, t, can, vb.
+`pkg/web` yalnızca `net/http` üzerine kuruludur ve **fiber'i import etmez**. Fiber
+sarmalayıcıları [`pkg/web/fiberweb`](fiberweb/README.md) alt paketindedir; iş mantığı
+(oturum, flash, old input, CSRF deposu, rol çıkarımı, menü) tek yerde, burada durur.
+
+Bağımlılıklar: `gorilla/sessions`, `pkg/security` (HTML temizleme + CSRF çekirdeği),
+`pkg/router`, `pkg/localization`, `pkg/forms`.
 
 ---
 
-## Jet Global Helper'lar (JetGlobalHelpers)
-
-`config.NewEngine` içinde çağırılır ve Jet'e enjekte edilir:
+## 1. Oturum deposu
 
 ```go
-engine.AddFuncMap(web.JetGlobalHelpers())
+// Uygulama başlangıcında bir kez (32+ bayt rastgele anahtar):
+web.InitSessionStore(hashKey)
+
+// Çerez içeriğini ŞİFRELEMEK için (önerilir) ikinci anahtar da verin; rotasyon için
+// eski çiftleri sona ekleyebilirsiniz:
+web.InitSessionStoreKeys(hashKey, blockKey /* 16/24/32 bayt */)
+
+// Geliştirmede (http://) Secure bayrağını kapatmak için:
+opts := web.DefaultSessionOptions()
+opts.Secure = false
+web.SetSessionOptions(&opts)
 ```
 
-Mevcut helper'lar (seçme):
-- `route(name, ...params) string` — adlandırılmış route için URL üretir
-- `tag(name, ...args) any` — `web.RegisterTag` ile kaydedilen tag'i çağırır
-- `dict(k1,v1,k2,v2,...) map[string]any` — küçük map kurucu
-- `static(path, [version]) string` ve `assets(...)` — statik içerik URL'si
-- `is_auth(bool) bool`, `current_user(u) any`, `has_role(u, role) bool`, `csrf_token(tok) string`
-- `old(ctx, key) string` — önceki form değeri
-- `t([ctx], key, [data]) string` — i18n çeviri (CRM'de eksik çeviriler loglanır)
-- `can(ctx, object, action) bool` — yetkilendirme; uygulama başlangıcında `web.SetCanChecker` ile enjekte edilir
-- `user_attr(u, key) any` — kullanıcıdan attribute çekme
+| Fonksiyon | Açıklama |
+|---|---|
+| `InitSessionStore(key []byte)` | Yalnızca imza anahtarıyla depo kurar. Varsayılanlar: `Path=/`, `HttpOnly`, `Secure`, `SameSite=Lax`, `MaxAge=3600`. |
+| `InitSessionStoreKeys(keyPairs ...[]byte)` | gorilla `keyPairs` biçimi (hash, block, ...). |
+| `DefaultSessionOptions() sessions.Options` | Yukarıdaki güvenli varsayılanlar. |
+| `SetSessionOptions(*sessions.Options)` | Seçenekleri değiştirir; `nil` yok sayılır. Kilit altında aynı anahtarlarla yeni depo kurar. `MaxAge > 0` ise imzanın sunucu tarafı geçerliliği de aynı süreye çekilir. |
+| `GetSessionStore() *sessions.CookieStore` | Alttaki depo (salt okunur kullanın). |
 
-Kullanım (Jet):
-```jet
-<a href="{{ route("user.show", user.ID) }}">Profile</a>
-{{ t(ctx, "welcome", dict("name", user.Name)) }}
-{{ if can(ctx, "/admin", "GET") }}...{{ end }}
-```
+`InitSessionStore` çağrılmadan depo kullanılırsa **sabit anahtar kullanılmaz**: süreç başına
+`crypto/rand` ile rastgele anahtar üretilir, `slog` ile uyarı yazılır ve `Secure=false` olur.
+Oturumlar yeniden başlatmada geçersizleşir — bu yalnızca geliştirme içindir.
 
-> Not: `can()` fonksiyonu, projede `InitSessionsWithOptions` sırasında `web.SetCanChecker` ile Casbin `policy.Enforce`'e delege edilir. `pkg/web` paketi `pkg/policy`'ye doğrudan bağlı değildir; böylece import döngüsü oluşmaz.
+Bozuk ya da eski anahtarla imzalanmış çerezler hata üretmez; boş yeni oturumla devam edilir.
 
----
-
-## Template Filtreleri (JetTemplateFilters)
-
-`config.NewEngine` içinde çağırılır ve Jet'e enjekte edilir:
+## 2. Flash mesajları
 
 ```go
-engine.AddFuncMap(web.JetTemplateFilters())
+_ = web.AddFlash(w, r, "success", "Kaydedildi")                       // yönlendirmeden
+_ = web.FlashAndRedirect(w, r, "error", "Hatalı", "/form", http.StatusSeeOther)
+
+msg, _ := web.GetFlash(w, r, "success")      // ilk mesajı tüketir, diğerleri kalır
+all, _ := web.GetFlashes(w, r, "success")    // o anahtarın tümü
+m, _ := web.GetAllFlashes(w, r)              // map[anahtar][]string, hepsini tüketir
+_ = web.ClearFlashes(w, r)                   // tüm anahtarlardaki flash'ları siler
 ```
 
-Mevcut filtreler:
-- `upper(string) string`
-- `default(value, def) any` — value boş/zero ise def döner
-- `length(x) int` — string için rune sayısı, slice/map için len
-- `truncatewords(s, n) string` — kelime bazlı kırpma
-- `date(time, layout) string` — time.Time formatlar
-- `safe(s string) template.HTML` — HTML işaretleme (kullanıcı girdilerinde dikkat!)
-- `sanitize(s string, mode? string) template.HTML` — XSS filtreleme; `mode`:
-  - `"relaxed"` (varsayılan): UGC için uygun (bluemonday.UGCPolicy)
-  - `"strict"`: En katı politika (bluemonday.StrictPolicy)
+Flash olmayan oturum değerleri (ör. old input) `GetAllFlashes` / `ClearFlashes` tarafından
+atlanır.
 
-Kullanım (Jet):
-```jet
-{{ upper("deneme") }}
-{{ default(User.Name, "Anonim") }}
-{{ length("ışık") }}
-{{ truncatewords(Post.Body, 20) }}
-{{ date(Now, "2006-01-02") }}
-{{ safe("<b>bold</b>") }}
-{{ sanitize(Comment.Body) }}                // relaxed (varsayılan)
-{{ sanitize(Comment.Body, "strict") }}     // strict mod
-```
-
----
-
-## Form Helper'ları (JetFormHelpers)
-
-`config.NewEngine` içinde çağırılır ve Jet'e enjekte edilir:
+## 3. Old input (form değerlerini geri doldurma)
 
 ```go
-engine.AddFuncMap(web.JetFormHelpers())
+_ = web.SetOldInputs(w, r, r.PostForm)   // yönlendirmeden önce
+old, _ := web.GetOldInputs(w, r)         // sonraki istekte (tüketir)
 ```
 
-Mevcut helperlar:
-- `form_is_valid(Form) bool`
-- `form_error(Form, "field") string`
-- `form_has_error(Form, "field") bool`
-- `form_cleaned(Form, "field") any`
+- Hassas alanlar **asla** yazılmaz: adında `password`, `passwd`, `secret`, `token`, `csrf`,
+  `creditcard`, `cardnumber`, `iban` geçenler; `_ - . [ ]` ile bölünmüş parçalarından biri
+  `pwd`, `pass`, `card`, `cvv`, `cvc`, `ssn`, `otp`, `pin` olanlar ve `card` ile başlayanlar.
+  Ek desen: `web.AddSensitiveFieldPatterns("tckn")`; kontrol: `web.IsSensitiveField(name)`.
+- Boyut sınırı (çerez ~4KB) her yolda uygulanır, kısaltma UTF-8 rune sınırında yapılır:
+  `SetOldInputLimits(maxJSON, perValue, firstValue)`, `OldInputLimits()`.
+- Kodlama tek başına: `EncodeOldInputs(url.Values) (string, error)`.
 
-Kullanım (Jet):
-```jet
-{{ if form_has_error(Form, "email") }}<div class="err">{{ form_error(Form, "email") }}</div>{{ end }}
-<input type="email" name="email" value="{{ default(form_cleaned(Form, "email"), "") }}">
-```
-
----
-
-## Fiber Form Bind Yardımcıları
-
-HTTP form ya da JSON gövdesini kolayca `forms.Form` nesnesine dönüştürmek için:
+## 4. Kullanıcı oturumu, giriş ve yetki
 
 ```go
-f := web.FiberForm(c)       // application/x-www-form-urlencoded veya multipart
-f := web.FiberJSONForm(c)   // application/json
+_ = web.SetUserInSession(w, r, map[string]any{"id": 7, "name": "Ada", "role": "admin"})
+u, ok := web.GetUserFromRequest(r)   // JSON → map[string]any
+_ = web.ClearUserFromSession(w, r)   // logout
 
-ok := f.ValidateMap(map[string]string{
-  "email": "required|email",
-  "pass":  "required|min=6",
-})
-if !ok {
-  // f.Errors ile hataları kullanın
+web.SetAuthChecker(func(r *http.Request) bool { _, ok := web.GetUserFromRequest(r); return ok })
+mux.Handle("/panel", web.LoginRequiredMiddleware()(panel))
+mux.HandleFunc("/profil", web.LoginRequired(profil, nil))
+```
+
+- `SetUserInSession` JSON'a çevrilemeyen kullanıcıda hata döner; eski `user` anahtarını temizler.
+- `LoginRequired` / `LoginRequiredMiddleware`: **AuthChecker ayarlanmamışsa erişim reddedilir**.
+  Varsayılan başarısızlık: HTML → `302 /login`, diğerleri → `401 {"error":"unauthorized"}`.
+- `WithUser(r, u)` / `UserFromCtx(ctx)`: context'te kullanıcı taşıma.
+
+Rol çıkarımı projede tek yerdedir:
+
+```go
+role := web.ExtractUserRole(u, web.GuestRole) // map["role"] veya RoleProvider (GetRole() string)
+web.HasRole(u, "admin")
+web.GetUserAttr(u, "name")
+
+web.SetCanChecker(policy.Check)               // pkg/policy ile (imza uyumlu)
+web.Can(u, "/admin", "GET")                   // checker yoksa / hata verirse false
+```
+
+## 5. CSRF (oturum tabanlı)
+
+Doğrulama mantığı `pkg/security`'dedir; `pkg/web` yalnızca token'ı `session-csrf` çerezinde
+saklayan `CSRFStore`'u sağlar. Fiber tarafı (`fiberweb.CSRF`) aynı çerezi ve token'ı kullanır.
+
+```go
+h := web.CSRFMiddleware(&security.CSRFOptions{SkipPaths: []string{"/api/*"}})(mux)
+
+// handler içinde:
+tok := security.CSRFTokenFromContext(r.Context())
+// formda: <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
+// veya başlıkta: X-CSRF-Token
+```
+
+Yardımcılar: `CSRFToken(w, r)`, `VerifyCSRFToken(r, provided) error`, `CSRFStore()`.
+
+## 6. Güvenli yönlendirme
+
+```go
+web.SetRedirectWhitelist([]string{"example.com"})
+next := web.NormalizeSafeRedirect(r.URL.Query().Get("next"), "/")
+```
+
+`IsSafeRedirect` yalnızca `/` ile başlayan göreli yolları ve whitelist'teki host'lara giden
+`http`/`https` URL'lerini kabul eder. `//evil.com`, `/\evil.com`, ters eğik çizgi veya kontrol
+karakteri (tab/CR/LF) içerenler, `javascript:`/`data:` gibi şemalar ve `user@host` biçimi reddedilir.
+
+## 7. Dil tercihi
+
+```go
+_ = web.SetPreferredLang(w, r, "en")        // geçersiz kodda ErrInvalidLang
+lang, ok := web.PreferredLang(r)
+langs := web.RequestLangs(r, "tr")           // oturum tercihi → Accept-Language → fallback
+```
+
+## 8. Şablon yardımcıları
+
+```go
+funcs := web.JetGlobalHelpers()      // her çağrı kopya döner; harita bir kez kurulur
+filters := web.JetTemplateFilters()
+formFns := web.JetFormHelpers()
+tmpl := template.New("x").Funcs(web.TemplateFuncs(w, r)) // route, flash + RegisterTag ile eklenenler
+```
+
+`JetGlobalHelpers`: `route`, `tag`, `dict`, `static`, `assets`, `is_auth`, `current_user`,
+`has_role`, `csrf_token`, `user_attr`, `old(url.Values, key)`, `t([*http.Request,] key[, data])`,
+`can(*http.Request|user, object, action)`. Fiber context kabul eden sürüm:
+`fiberweb.JetGlobalHelpers()`.
+
+`JetTemplateFilters`: `upper`, `default`, `length` (rune), `truncatewords`, `date`, `safe`,
+`sanitize(s[, "strict"])` — temizleme `pkg/security` ile yapılır, bilinmeyen mod strict uygular.
+`safe` ve `sanitize` `html/template.HTML` döner; `html/template` bunu kaçışsız basar ama
+**Jet `template.HTML`'i güvenli saymaz** ve yine kaçış uygular. Jet'te `raw`'a aktarın:
+`{{ sanitize(UntrustedHTML) | raw }}`.
+
+`WantsHTML(accept)` yalnızca `text/html`/`application/xhtml+xml` içeren `Accept`
+başlığında true döner; boş ve `*/*` (curl, fetch) HTML sayılmaz, bu yüzden API
+istekleri `LoginRequired*`'dan 302 değil 401 JSON alır.
+
+Tag registry: `RegisterTag(name, fn)`, `UnregisterTag`, `CallTag(name, args...) any`,
+`CallTagE(name, args...) (any, error)`. Argüman sayısı/tipi uyuşmazsa ya da tag panik atarsa
+`CallTagE` hata döner; `CallTag` hatayı loglayıp `""` döner (iç hata metni sayfaya basılmaz).
+
+## 9. Menü
+
+```go
+items := []web.MenuItem{
+    {LabelKey: "menu.home", RouteName: "home"},
+    {LabelKey: "menu.admin", URL: "/admin", Object: "/admin", Action: "GET"},
 }
+menu := web.BuildMenu(r.URL.Path, user, items)  // fiber: fiberweb.BuildMenu(c, items)
 ```
 
-> Not: `FiberForm`, `fasthttp` PostArgs ve `MultipartForm` üzerinden alanları toplar. Bir alanın birden fazla değeri varsa []string olarak yazılır.
+`Object/Action` dolu öğeler `web.Can` ile kontrol edilir; checker yoksa gizlenir.
+`HideIfEmptyChildren`, `Active` (segment sınırlı önek eşleşmesi), `Target`, `Badge` desteklenir.
+
+## 10. Diğer
+
+- JSON yanıtları: `RespondJSON`, `JSON`, `Ok`, `Created`, `NoContent`, `Error`
+  (`Error` hata metnini istemciye yazar; iç hataları doğrudan vermeyin).
+- Rotalar: `RegisterRoute`, `Route`, `RedirectTo`, `RedirectPermanent`, `RedirectTemporary`, `RedirectRoute`.
 
 ---
 
-## Flash / Old Inputs (mevcut)
+## Güvenlik notları
 
-- `FiberSetOldInputs`, `FiberOld`, `FiberAllOld`, `FiberFlash`, `FiberSetFlash`, `FiberAddFlash` gibi yardımcılar mevcuttur. Ayrıntı için dosyaları inceleyin.
+- **Anahtar**: `InitSessionStore` çağrılmazsa rastgele süreç anahtarı kullanılır ve uyarı loglanır;
+  üretimde mutlaka 32+ baytlık gizli anahtar verin. Tek anahtar yalnızca imzalar; çerezdeki
+  kullanıcı JSON'u istemci tarafından okunabilir → `InitSessionStoreKeys(hash, block)` önerilir.
+- **Fail-closed**: `AuthChecker` yoksa `LoginRequired*` reddeder; `CanChecker` yoksa `Can`/menü false döner.
+- **CSRF** karşılaştırması sabit zamanlıdır (`crypto/subtle`); token yoksa/oturum okunamazsa istek reddedilir.
+- **Old input** hassas alanları saklamaz; çerez boyutu sınırlıdır.
+- **Açık yönlendirme**: kullanıcıdan gelen `next` değerlerini `NormalizeSafeRedirect` ile süzün.
+  Fallback verilmezse `/`; açıkça `""` verilirse boş döner (`next` yok/güvensiz ile `next=/` ayrılır).
+- **`safe` filtresi** kaçış yapmaz; kullanıcı girdisi için `sanitize` kullanın.
+- Paket globalleri (depo, whitelist, limitler, tag/checker kayıtları) kilitlidir; eşzamanlı kullanım güvenlidir.
 
----
+## Geçiş notu (eski → yeni)
 
-## Tag Registry (Çakışma yok)
+Fiber kodu `pkg/web/fiberweb` paketine taşındı ve `Fiber` öneki kaldırıldı:
 
-`filters.go` filtreleri sağlar (ör. `upper`, `default`, ...). `tags.go` ise dinamik tag kayıt/çağrı mekanizmasıdır (`RegisterTag`, `CallTag`). `config.go` içindeki `"tag"` fonksiyonu bu registry'i çağırır. Bu iki mekanizma farklı amaçlara hizmet eder ve çakışmaz.
+| Eski (`pkg/web`) | Yeni |
+|---|---|
+| `FiberFlash`, `FiberSetFlash`, `FiberAddFlash`, `FiberAllFlashes` | `fiberweb.Flash`, `fiberweb.SetFlash`, `fiberweb.AddFlash`, `fiberweb.AllFlashes` |
+| `FiberSetUser`, `FiberClearUser`, `FiberAttachUser`, `FiberRequireLogin` | `fiberweb.SetUser`, `fiberweb.ClearUser`, `fiberweb.AttachUser`, `fiberweb.RequireLogin` |
+| `FiberCurrentUser`, `FiberIsAuthenticated`, `InjectUserIntoView` | `fiberweb.CurrentUser`, `fiberweb.IsAuthenticated`, `fiberweb.InjectUserIntoView` |
+| `FiberAuthorize`, `FiberRequireRoles` | `fiberweb.Authorize`, `fiberweb.RequireRoles` |
+| `FiberCSRF`, `FiberCSRFWithConfig`, `FiberGetOrCreateCSRF`, `CSRFConfig` | `fiberweb.CSRF`, `fiberweb.CSRFWithConfig`, `fiberweb.CSRFToken`, `fiberweb.CSRFConfig` |
+| `Render` | `fiberweb.Render` |
+| `FiberSetOldInputs`, `FiberCommitOldInputs`, `FiberGetOldInputs`, `FiberOld`, `FiberOldAll`, `FiberAutoOldInputs` | `fiberweb.SetOldInputs`, `CommitOldInputs`, `GetOldInputs`, `Old`, `OldAll`, `AutoOldInputs` |
+| `FiberForm`, `FiberJSONForm` | `fiberweb.Form`, `fiberweb.JSONForm` |
+| `FiberSetPreferredLang`, `FiberPreferredLang`, `FiberLangs` | `fiberweb.SetPreferredLang`, `fiberweb.PreferredLang`, `fiberweb.Langs` (artık oturum tercihini de içerir) |
+| `FiberLogCookieSizes` | `fiberweb.LogCookieSizes` |
+| `BuildMenu(c *fiber.Ctx, items)` | `web.BuildMenu(path, user, items)` veya `fiberweb.BuildMenu(c, items)` |
+| `JetGlobalHelpers()` (fiber ctx ile `t/old/can`) | `fiberweb.JetGlobalHelpers()`; `web.JetGlobalHelpers()` artık net/http sürümü |
+| `OldInputsMaxJSONSize`, `OldInputsTruncatePerValue`, `OldInputsTruncateFirstVal` (değişkenler) | `SetOldInputLimits` / `OldInputLimits()` |
 
----
-
-## Sık Kullanılan Pattern’ler (Adım Adım)
-
-Bu bölüm, Jet şablonlarında en sık ihtiyaç duyulan iki kalıbı “sıfırdan” anlatır: (1) can() ile menü öğesi gizleme/gösterme, (2) t() ile parametreli çeviri. Kod örnekleri Fiber + Jet ile birebir uyumludur.
-
-Ön Bilgi: Şablonlarda ctx değişkeni
-- Jet içinde bazı helper’lar (özellikle can ve t) Fiber context’e (ctx) ihtiyaç duyar. Eğer şablon verisine ctx eklemediyseniz, handler’da ekleyin:
-
-```go
-return c.Render("pages/home", fiber.Map{
-  "ctx": c,          // önemli: can() ve t() için
-  "User": userDTO,   // örnek veri
-})
-```
-
-### 1) Menülerde Yetkiye Göre Göster/Gizle (can)
-
-Amaç: Kullanıcının yetkisine göre menü öğelerini göstermek ya da gizlemek.
-
-1. Arka Plan (Uygulama Başlangıcı)
-- CRM tarafında (cmd/crm/config) can() helper’ı, Casbin’e delege edilir. Bu zaten `InitSessionsWithOptions` içinde yapılır:
-
-```go
-// cmd/crm/config/config.go
-web.SetCanChecker(func(subject, object, action string) (bool, error) {
-  return policy.Enforce(subject, object, action)
-})
-```
-
-- subject: kullanıcının rolü (guest, user, admin vs). web paketi bu rolü oturumdaki kullanıcıdan otomatik çıkarır (ExtractUserRole). Siz sadece ctx geçirirsiniz.
-- object/action: sizin belirleyeceğiniz kaynak ve eylem. En basiti: object = istek yolu ("/admin"), action = HTTP method ("GET").
-
-2. Politika (Örnek)
-- Casbin politikası (basit fikir vermesi için):
-```
-# subject, object, action
-admin, /admin, GET
-admin, /admin, POST
-user, /reports, GET
-```
-
-3. Şablonda Kullanım (Örnekler)
-- Tamamen gizlemek:
-```jet
-{{ if can(ctx, "/admin", "GET") }}
-  <li><a href="/admin">Admin</a></li>
-{{ end }}
-```
-
-- Erişimi yoksa öğeyi pasif (disabled) yapmak:
-```jet
-<li class="nav-item {{ if not can(ctx, "/reports", "GET") }}disabled{{ end }}">
-  <a href="/reports" class="nav-link">Raporlar</a>
-</li>
-```
-
-- Tooltip ile neden gizli olduğunu anlatmak:
-```jet
-{{ if can(ctx, "/billing", "GET") }}
-  <a href="/billing">Faturalama</a>
-{{ else }}
-  <span title="Bu bölüme erişiminiz yok">Faturalama</span>
-{{ end }}
-```
-
-4. İpucu: Nesne/Aksiyon İsimleri
-- Yol bazlı kontrol yerine daha kavramsal kontroller kullanabilirsiniz: object = "reports", action = "view".
-```jet
-{{ if can(ctx, "reports", "view") }}
-  <a href="{{ route("reports.index") }}">Raporlar</a>
-{{ end }}
-```
-- Bu durumda Casbin politikalarınızı da aynı isimlerle yazar, router’da named route kullanırsınız.
-
-5. Hata Ayıklama
-- can() hep false dönüyorsa: ctx’in şablona verildiğinden, kullanıcının rolünün doğru çıkarıldığından ve policy’de subject/object/action değerlerinizin birebir eşleştiğinden emin olun.
-
-### 2) Parametreli Çeviri (t)
-
-Amaç: Kullanıcıya diline göre, içinde değişken geçebilen mesajlar göstermek. Örn: “Hoş geldin, Ahmet!”.
-
-1. Çeviri Dosyasında Mesajı Tanımlayın
-- go-i18n formatına benzer şekilde key ve şablon tanımlarsınız (örnek amaçlı sade gösterim):
-
-TR (tr):
-```json
-{
-  "welcome": "Hoş geldin, {{.name}}!",
-  "items_count": "Sepetinde {{.count}} ürün var."
-}
-```
-EN (en):
-```json
-{
-  "welcome": "Welcome, {{.name}}!",
-  "items_count": "You have {{.count}} items in your cart."
-}
-```
-
-> Projede localization paketi Accept-Language ve (varsa) session’dan dil tespitini halleder. Eksik çeviri varsa, CRM config’i log’a düşer.
-
-2. Şablonda Kullanım
-- ctx olmadan (varsayılan dil zinciriyle):
-```jet
-{{ t("welcome", dict("name", User.Name)) }}
-```
-
-- ctx ile (tarayıcı Accept-Language + tercih edilen dil desteğiyle):
-```jet
-{{ t(ctx, "welcome", dict("name", User.Name)) }}
-```
-
-- Başka parametrelerle:
-```jet
-{{ t(ctx, "items_count", dict("count", Cart.Count)) }}
-```
-
-3. Dil Tercihini Kullanıcıya Bırakmak (Opsiyonel)
-- Bir dil seçme linki/yolu yapıp, handler’da dili session’a yazın:
-
-```go
-func SetLangHandler(c *fiber.Ctx) error {
-  lang := c.Query("lang", "tr") // "tr" | "en" | ...
-  if err := web.FiberSetPreferredLang(c, lang); err != nil {
-    return err
-  }
-  return c.Redirect("/")
-}
-```
-
-- Sonra Jet’te:
-```jet
-<a href="/set-lang?lang=tr">TR</a> | <a href="/set-lang?lang=en">EN</a>
-```
-
-4. İpucu: Eksik Çevirileri Yakalama
-- CRM’de t() override’ı, bulunamayan key’leri log’lar. Geliştirme sırasında log çıktısına bakarak eksikleri kolayca tamamlayabilirsiniz.
-
-5. Güvenlik Notu
-- Çeviri metinleri içinde kullanıcı girdisi yer alacaksa, XSS açısından ya otomatik kaçışa güvenin (Jet varsayılan) ya da HTML kabul ediyorsanız `sanitize` filtresini kullanın:
-```jet
-{{ sanitize(t(ctx, "welcome_html", dict("name", User.Name)), "strict") }}
-```
-
----
-
-İhtiyaç duyarsanız bu pattern’lerin controller/route düzeyinde tam örneklerini (kod + şablon) de ekleyebiliriz. Hangi sayfada kullanmak istediğinizi söylerseniz, birebir entegre ederim.
-
----
-
-## Menü Builder (pkg/web/menu.go)
-
-Menü öğelerini yetkiye (can checker) ve mevcut path’e göre filtreleyip “aktif” durumunu işaretleyen küçük bir iskelet sunar.
-
-### Model (MenuItem)
-Alanlar:
-- LabelKey (string): Çeviri anahtarı. Jet: `t(ctx, item.LabelKey)`
-- RouteName (string): Named route. Varsa URL otomatik çözülür (pkg/router.ReverseURL).
-- URL (string): Doğrudan link. `RouteName` yoksa kullanılır.
-- Object (string), Action (string): can checker için nesne/aksiyon (örn. object: "/admin", action: "GET").
-- Children ([]MenuItem): Alt menüler. BuildMenu yetkiye göre her biri için filtreleme yapar.
-- Icon (string): UI için ikon sınıfı (örn. "icon-home").
-- Active (bool, omit): BuildMenu tarafından setlenir; self veya alt öğeleri aktifse true.
-- HideIfEmptyChildren (bool): true ise öğe sadece görünür bir çocuğu varsa gösterilir; self yetkisizse başlık gibi kalır (URL boşaltılır).
-- Target (string): Link hedefi (örn. "_blank"). `_blank` ise `rel="noopener noreferrer"` eklemeniz önerilir.
-- Badge (string), BadgeClass (string): Küçük rozet ve sınıfı (örn. "New", "badge badge-warning").
-
-### Active eşleştirme kuralları
-isActive(currentPath, itemURL):
-- Trailing slash normalize edilir ("/admin/" == "/admin").
-- Tam eşleşme ⇒ aktif.
-- itemURL "/" değilse, segment sınırı ile prefix ⇒ aktif (örn. "/admin" -> "/admin/settings", fakat "/admin" -> "/administrator" değil).
-- Not: Fiber `c.Path()` querystring içermez; active kontrolü path bazlıdır.
-
-### Kullanım (Controller)
-```go
-func SomeHandler(c *fiber.Ctx) error {
-    items := []web.MenuItem{
-        {LabelKey: "menu.home", RouteName: "home", Icon: "icon-home"},
-        {LabelKey: "menu.docs", URL: "/docs", Target: "_blank", Badge: "New", BadgeClass: "badge"},
-        {LabelKey: "menu.admin", URL: "/admin", Object: "/admin", Action: "GET"},
-        {
-            LabelKey:            "menu.secure",
-            HideIfEmptyChildren: true,
-            Children: []web.MenuItem{
-                {LabelKey: "menu.admin", URL: "/admin", Object: "/admin", Action: "GET"},
-            },
-        },
-    }
-    menu := web.BuildMenu(c, items)
-    data := map[string]any{"Menu": menu, "ctx": c}
-    return web.Render(c, "your_template", data)
-}
-```
-
-Jet (şablon) örneği:
-```jet
-<ul class="menu">
-  {{ range $it := Menu }}
-    <li class="menu-item{{ if $it.Active }} active{{ end }}">
-      {{ if $it.URL }}
-        <a class="menu-link" href="{{ $it.URL }}"{{ if $it.Target }} target="{{ $it.Target }}"{{ if $it.Target == "_blank" }} rel="noopener noreferrer"{{ end }}{{ end }}>
-          {{ if $it.Icon }}<i class="{{ $it.Icon }}"></i> {{ end }}{{ t(ctx, $it.LabelKey) }}
-          {{ if $it.Badge }} <span class="{{ default($it.BadgeClass, "badge") }}">{{ $it.Badge }}</span>{{ end }}
-        </a>
-      {{ else }}
-        <span class="menu-label{{ if $it.Active }} active{{ end }}">{{ t(ctx, $it.LabelKey) }}</span>
-      {{ end }}
-      {{ if $it.Children }}
-        <ul class="submenu">
-          {{ range $ch := $it.Children }}
-            <li class="menu-item{{ if $ch.Active }} active{{ end }}">
-              {{ if $ch.URL }}
-                <a href="{{ $ch.URL }}">{{ t(ctx, $ch.LabelKey) }}</a>
-              {{ else }}
-                <span>{{ t(ctx, $ch.LabelKey) }}</span>
-              {{ end }}
-            </li>
-          {{ end }}
-        </ul>
-      {{ end }}
-    </li>
-  {{ end }}
-</ul>
-```
-
-### Uygulama genelinde kullanmak (Tag ile)
-`cmd/crm/config/NewEngine` içinde bir tag tanımlayabilirsiniz (bu repoda `main_menu` hazır):
-```go
-web.RegisterTag("main_menu", func(c *fiber.Ctx) []web.MenuItem {
-    items := []web.MenuItem{
-        {LabelKey: "layout.nav.home", RouteName: "home", Icon: "icon-home"},
-        {LabelKey: "layout.nav.about", RouteName: "about"},
-        {LabelKey: "layout.nav.demo_menu", RouteName: "demo.menu", Badge: "New", BadgeClass: "badge"},
-        {LabelKey: "layout.nav.admin", URL: "/admin", Object: "/admin", Action: "GET"},
-    }
-    return web.BuildMenu(c, items)
-})
-```
-Jet’te çağırıp nav oluşturun (ör. `base.jet`):
-```jet
-{{ $menu := tag("main_menu", ctx) }}
-{{ range $it := $menu }}
-  {{ if $it.URL }}
-    <a class="nav-link{{ if $it.Active }} active{{ end }}" href="{{ $it.URL }}"{{ if $it.Target }} target="{{ $it.Target }}"{{ if $it.Target == "_blank" }} rel="noopener noreferrer"{{ end }}{{ end }}>
-      {{ if $it.Icon }}<i class="{{ $it.Icon }}"></i> {{ end }}{{ t(ctx, $it.LabelKey) }}
-      {{ if $it.Badge }} <span class="{{ default($it.BadgeClass, "badge") }}">{{ $it.Badge }}</span>{{ end }}
-    </a>
-  {{ else }}
-    <span class="nav-label{{ if $it.Active }} active{{ end }}">{{ t(ctx, $it.LabelKey) }}</span>
-  {{ end }}
-{{ end }}
-```
-
-### İpuçları
-- can checker: `web.SetCanChecker` ile enjekte edilir (CRM’de Casbin `policy.Enforce`).
-- Role çıkarımı: `ExtractUserRole` varsayılan olarak user map’inden `role` anahtarına bakar; ihtiyacınıza göre düzenleyin.
-- i18n: `LabelKey` Jet içinde `t(ctx, key)` ile çevrilir. Eksik anahtarlar log’a düşer (CRM config).
-- Aktiflik: Query stringler `c.Path()`’e dahil olmadığı için etkilemez; trailing slash ve segment sınırı normalize edilir.
-- Erişim yokken başlık: `HideIfEmptyChildren` true ve `allowedSelf` false ise `URL` boşaltılır; başlık gibi görüntüleyebilirsiniz.
+Davranış değişiklikleri: `LoginRequired*` checker yokken reddeder; `GetFlash` aynı anahtardaki
+diğer mesajları korur; `SetUserInSession` JSON'a çevrilemeyen kullanıcıda hata döner;
+`CallTag` hata metni yerine `""` döner; `IsSafeRedirect` daha katıdır; `sanitize` bilinmeyen
+modda strict uygular.

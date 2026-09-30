@@ -2,31 +2,83 @@ package web
 
 import (
 	"fmt"
+	"maps"
+	"net/http"
 	"net/url"
+	"sync"
 
-	"github.com/gofiber/fiber/v2"
 	"github.com/mustafacaglarkara/webdev/pkg/localization"
 	"github.com/mustafacaglarkara/webdev/pkg/router"
 )
 
-// JetGlobalHelpers: Jet veya html/template ile kullanılabilecek genel amaçlı helper fonksiyonlar.
-// Bu fonksiyonlar uygulamaya özel olmayan, tekrar kullanılabilir yardımcılar sağlar.
-func JetGlobalHelpers() map[string]any {
+// DefaultLang t() yardımcısının son çare dili.
+const DefaultLang = "tr"
+
+var (
+	globalsOnce sync.Once
+	globals     map[string]any
+)
+
+// staticURL statik varlık URL'si üretir; opsiyonel sürüm ?v=... olarak eklenir.
+func staticURL(path string, params ...any) string {
+	if len(path) == 0 || path[0] != '/' {
+		path = "/" + path
+	}
+	if len(params) > 0 {
+		q := url.Values{}
+		q.Set("v", fmt.Sprint(params[0]))
+		return "/static" + path + "?" + q.Encode()
+	}
+	return "/static" + path
+}
+
+// Translate t() yardımcısının net/http sürümü: args = [*http.Request,] key [, map[string]any].
+// İlk argüman *http.Request ise dil sırası RequestLangs ile (oturum tercihi → Accept-Language)
+// belirlenir; aksi halde DefaultLang kullanılır.
+func Translate(args ...any) string {
+	if len(args) == 0 {
+		return ""
+	}
+	langs := []string{DefaultLang}
+	i := 0
+	if r, ok := args[0].(*http.Request); ok {
+		if r != nil {
+			langs = RequestLangs(r, DefaultLang)
+		}
+		i = 1
+	}
+	return TranslateLangs(langs, args[i:]...)
+}
+
+// TranslateLangs verilen dil listesiyle çevirir: args = key [, map[string]any].
+func TranslateLangs(langs []string, args ...any) string {
+	if len(args) == 0 {
+		return ""
+	}
+	key, ok := args[0].(string)
+	if !ok {
+		return ""
+	}
+	var data map[string]any
+	if len(args) > 1 {
+		data, _ = args[1].(map[string]any)
+	}
+	return localization.TDefault(langs, key, data)
+}
+
+func buildGlobals() map[string]any {
 	return map[string]any{
-		"route": func(name string, args ...interface{}) string {
+		"route": func(name string, args ...any) string {
 			if s, err := router.ReverseURL(name, args...); err == nil {
 				return s
 			}
-			if p, ok := Route(name, args...); ok {
-				return p
-			}
 			return "#"
 		},
-		"tag": func(name string, args ...interface{}) any {
+		"tag": func(name string, args ...any) any {
 			return CallTag(name, args...)
 		},
-		// dict helper: dict("id","123","foo","bar") -> map[string]any{"id":"123","foo":"bar"}
-		"dict": func(args ...interface{}) map[string]any {
+		// dict("id","123","foo","bar") -> map[string]any{"id":"123","foo":"bar"}
+		"dict": func(args ...any) map[string]any {
 			m := map[string]any{}
 			for i := 0; i+1 < len(args); i += 2 {
 				k, ok := args[i].(string)
@@ -37,91 +89,41 @@ func JetGlobalHelpers() map[string]any {
 			}
 			return m
 		},
-		// static helper: builds a URL for static assets, optional version param
-		"static": func(path string, params ...interface{}) string {
-			// ensure leading slash
-			if len(path) == 0 || path[0] != '/' {
-				path = "/" + path
-			}
-			// optional version string as ?v=...
-			if len(params) > 0 {
-				v := fmt.Sprint(params[0])
-				q := url.Values{}
-				q.Set("v", v)
-				return "/static" + path + "?" + q.Encode()
-			}
-			return "/static" + path
-		},
-		// assets is an alias for static
-		"assets": func(path string, params ...interface{}) string {
-			return JetGlobalHelpers()["static"].(func(string, ...interface{}) string)(path, params...)
-		},
-		// jet helper funcs that operate on values passed from view data
+		"static":       staticURL,
+		"assets":       staticURL, // static takma adı
 		"is_auth":      func(isAuth bool) bool { return isAuth },
 		"current_user": func(u any) any { return u },
 		"has_role":     func(u any, role string) bool { return HasRole(u, role) },
 		"csrf_token":   func(tok string) string { return tok },
-		// old helper: old(ctx, 'field') -> delegates to FiberOld
-		"old": func(c any, key string) string {
-			if ctx, ok := c.(*fiber.Ctx); ok {
-				return FiberOld(ctx, key)
+		"user_attr":    func(u any, k string) any { return GetUserAttr(u, k) },
+		// old(Old, "field"): Old, handler'da GetOldInputs ile alınıp şablona verilen url.Values'tur.
+		"old": func(src any, key string) string {
+			if v, ok := src.(url.Values); ok {
+				return v.Get(key)
 			}
 			return ""
 		},
-		// Unified translation helper: usage: {{ t("key") }} or {{ t(ctx,"key") }}
-		"t": func(args ...interface{}) string {
-			if len(args) == 0 {
-				return ""
-			}
-			var (
-				ctx  *fiber.Ctx
-				key  string
-				data map[string]any
-			)
-			nextIdx := 0
-			if c0, ok := args[0].(*fiber.Ctx); ok {
-				ctx = c0
-				nextIdx = 1
-			}
-			if nextIdx >= len(args) {
-				return ""
-			}
-			if k, ok := args[nextIdx].(string); ok {
-				key = k
-				nextIdx++
-			} else {
-				return ""
-			}
-			if nextIdx < len(args) {
-				if m, ok := args[nextIdx].(map[string]any); ok {
-					data = m
+		// t("key") / t(req, "key") / t(req, "key", dict(...))
+		"t": Translate,
+		// can(req|user, object, action): *http.Request verilirse oturumdaki kullanıcı kullanılır,
+		// aksi halde argüman kullanıcı olarak kabul edilir. Checker yoksa false.
+		"can": func(src any, obj, act string) bool {
+			if r, ok := src.(*http.Request); ok {
+				if r == nil {
+					return Can(nil, obj, act)
 				}
+				u, _ := GetUserFromRequest(r)
+				return Can(u, obj, act)
 			}
-			var langs []string
-			if ctx != nil {
-				langs = FiberLangs(ctx, "tr")
-			} else {
-				langs = []string{"tr"}
-			}
-			return localization.TDefault(langs, key, data)
+			return Can(src, obj, act)
 		},
-		// can(ctx, obj, act) -> bool (policy bağımlılığı yok, enjekte edilen checker kullanılır)
-		"can": func(c any, obj, act string) bool {
-			ctx, ok := c.(*fiber.Ctx)
-			if !ok {
-				return false
-			}
-			sub := "guest"
-			if u, ok2 := FiberCurrentUser(ctx); ok2 {
-				sub = ExtractUserRole(u, "guest")
-			}
-			if chk := getCanChecker(); chk != nil {
-				allowed, _ := chk(sub, obj, act)
-				return allowed
-			}
-			return false
-		},
-		// user_attr(user, key)
-		"user_attr": func(u any, k string) any { return GetUserAttr(u, k) },
 	}
+}
+
+// JetGlobalHelpers: Jet veya html/template ile kullanılabilecek genel amaçlı (net/http)
+// yardımcılar. Harita bir kez kurulur (WEB-19); her çağrı değiştirilebilir bir kopya döner.
+// Fiber context kabul eden sürüm için fiberweb.JetGlobalHelpers kullanın.
+func JetGlobalHelpers() map[string]any {
+	globalsOnce.Do(func() { globals = buildGlobals() })
+	return maps.Clone(globals)
 }

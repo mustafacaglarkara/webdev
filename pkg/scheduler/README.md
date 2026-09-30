@@ -1,79 +1,73 @@
 # scheduler
 
-Go ile zamanlanmış görevler (task scheduling) için yardımcı paket. Laravel/Django'daki gibi cron yazmadan, kod üzerinden zamanlanmış işler çalıştırmak için kullanılır. robfig/cron tabanlıdır.
-
----
-
-## Temel Kullanım
-
-### 1. Varsayılan Zamanlayıcı ile Basit Görev
+`robfig/cron/v3` üzerinde panik korumalı, loglu zamanlayıcı.
 
 ```go
-import (
-    "fmt"
-    "time"
-    "your/module/path/pkg/scheduler"
+import "github.com/mustafacaglarkara/webdev/pkg/scheduler"
+```
+
+## Kullanım
+
+```go
+m := scheduler.New(
+    scheduler.WithSeconds(),                 // 6 alanlı ifade: "sn dk sa gün ay haftagünü"
+    scheduler.WithLocation(time.UTC),
+    scheduler.WithSlog(slog.Default()),
+    scheduler.WithSkipIfStillRunning(),      // önceki çalışma bitmediyse atla
 )
 
-func main() {
-    scheduler.AddFunc("*/5 * * * *", func() {
-        fmt.Println("Her 5 dakikada bir çalışır:", time.Now())
-    })
-    scheduler.Start()
-    defer scheduler.Stop()
-    select {} // Uygulama açık kalsın
+id, err := m.AddFunc("*/10 * * * * *", func() {
+    fmt.Println("10 saniyede bir")
+})
+if err != nil {
+    return err
 }
-```
+m.Start()
 
-### 2. Kendi Manager'ınızla Gelişmiş Kullanım
+// ...
 
-```go
-mgr := scheduler.New(scheduler.WithSeconds(), scheduler.WithLocation(time.UTC))
-mgr.AddFunc("0 0 9 * * *", func() { fmt.Println("Her gün 09:00:00 UTC") })
-mgr.Start()
-defer mgr.Stop()
-```
-
-### 3. cron.Job Interface ile Kullanım
-
-```go
-type MyJob struct{}
-func (MyJob) Run() { fmt.Println("Job çalıştı:", time.Now()) }
-
-id, err := scheduler.AddJob("0 12 * * *", MyJob{}) // Her gün 12:00'de
-```
-
-### 4. Planlanmış İşleri Listeleme
-
-```go
-for _, entry := range scheduler.Entries() {
-    fmt.Printf("Job: %v, Next: %v\n", entry.ID, entry.Next)
+// Kapanış: yeni tetiklemeler durur, çalışan işler beklenir
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+if err := m.Shutdown(ctx); err != nil {
+    log.Println("işler zamanında bitmedi:", err)
 }
+m.Remove(id)
 ```
 
-### 5. Zamanlayıcıyı Durdurma ve Yeniden Başlatma
+`Stop()` bir `context.Context` döner; çalışan işler bittiğinde `Done()` kapanır:
 
 ```go
-scheduler.Stop()
+<-m.Stop().Done()
+```
+
+## Seçenekler
+
+| Seçenek | Açıklama |
+|---|---|
+| `WithSeconds()` | Saniye alanını etkinleştirir |
+| `WithLocation(loc)` | Saat dilimi (varsayılan `time.Local`) |
+| `WithLogger(cron.Logger)` | cron logger'ı |
+| `WithSlog(*slog.Logger)` | slog; cron bilgi mesajları `Debug`, hatalar `Error` |
+| `WithSkipIfStillRunning()` | Üst üste binen çalışmayı atla |
+| `WithDelayIfStillRunning()` | Üst üste binen çalışmayı öncekinin bitişine ertele |
+
+`SlogLogger(l)` bir `*slog.Logger`'ı `cron.Logger`'a uyarlar.
+
+Metotlar: `Start`, `Stop`, `Shutdown`, `AddFunc`, `AddJob`, `Remove`, `Entries`.
+
+## Varsayılan zamanlayıcı
+
+```go
+scheduler.AddFunc("0 3 * * *", nightlyCleanup) // 5 alanlı ifade
 scheduler.Start()
+defer func() { <-scheduler.Stop().Done() }()
 ```
 
----
-
-## Edge-Case ve Test Senaryoları
-
-- Hatalı cron ifadesi: AddFunc("hatalı", fn) → error döner.
-- n saniyede bir çalıştırmak için WithSeconds() ile "*/10 * * * * *" gibi 6 alanlı cron kullanılır.
-- Stop sonrası tekrar Start edilebilir, ancak işler tekrar planlanır.
-- Manager olmadan doğrudan scheduler.AddFunc ile varsayılan zamanlayıcı kullanılır.
-- AddJob ile aynı anda birden fazla job eklenebilir.
-
----
+Paket düzeyinde: `Default`, `Start`, `Stop`, `AddFunc`, `AddJob`, `Entries`.
 
 ## Notlar
-- Cron ifadeleri için robfig/cron dökümantasyonuna bakınız.
-- Saniye desteği için WithSeconds() kullanın (6 alanlı cron).
-- Zaman dilimi için WithLocation(time.UTC) gibi opsiyonlar ekleyebilirsiniz.
-- Tüm fonksiyonlar thread-safe'dir.
-- Daha fazla detay ve gelişmiş kullanım için kodu ve robfig/cron dökümantasyonunu inceleyin.
 
+- Her iş `cron.Recover` ile sarılır: panik loglanır, zamanlayıcı ve diğer işler çalışmaya devam eder.
+- İşler ayrı goroutine'lerde çalışır; paylaşılan veriye erişimi senkronize edin.
+- `Stop` çalışan işleri kesmez; uzun işler için kendi iptal mekanizmanızı (context) kullanın.

@@ -1,0 +1,5 @@
+<section class="narrow">
+  <h1>{{ Code }} · {{ Title }}</h1>
+  <p>{{ Message }}</p>
+  <p><a href="{{ route("home") }}">{{ t(ctx, "error.back_home") }}</a></p>
+</section>

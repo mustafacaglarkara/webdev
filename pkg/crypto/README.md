@@ -1,76 +1,115 @@
-# crypto paketi
+# crypto
 
-Bu paket, Go ile kriptografi işlemleri için yardımcı fonksiyonlar sunar. Şifreleme, hash, base64, HMAC, AES-GCM, bcrypt ve token üretimi gibi işlemler için kullanılır.
+Hash, parola özetleme, AES-GCM şifreleme, HMAC ve token yardımcıları.
 
-## Kurulum
-
-Modülünüze ekleyin:
-
-```
-go get <sizin-modul-adiniz>/pkg/crypto
-```
-
-## Fonksiyonlar ve Kullanım Örnekleri
-
-### MD5 ve SHA256 Hash
 ```go
-import "your/module/path/pkg/crypto"
-
-hash := crypto.MD5Hash("merhaba")
-sha := crypto.SHA256Hash("merhaba")
+import "github.com/mustafacaglarkara/webdev/pkg/crypto"
 ```
 
-### Base64 Encode/Decode
+## Hash ve Base64
+
 ```go
-b64 := crypto.Base64Encode("test")
-dec, _ := crypto.Base64Decode(b64)
+h := crypto.SHA256Hash("merhaba") // hex
+m := crypto.MD5Hash("merhaba")    // hex — yalnızca sağlama/uyumluluk için
+b := crypto.Base64Encode("veri")
+s, err := crypto.Base64Decode(b)
 ```
 
-### Bcrypt ile Şifre Hashleme
+> `MD5Hash` ve `SHA256Hash` parola saklamak için **kullanılmamalıdır**.
+
+## Parola (bcrypt)
+
 ```go
-hash, _ := crypto.HashPassword("sifre123")
-valid := crypto.CheckPassword(hash, "sifre123") // true
+hash, err := crypto.HashPassword("s3cr3t")
+ok := crypto.CheckPassword(hash, "s3cr3t")
 ```
 
-### Rastgele Bearer Token
+## Rastgele token
+
 ```go
-tok, _ := crypto.GenerateBearerToken(32)
+tok, err := crypto.GenerateBearerToken(32) // 32 bayt, base64url; opak oturum/API anahtarı
 ```
 
-### AES-GCM ile Şifreleme/Çözme
+## AES-GCM
+
 ```go
-enc, _ := crypto.EncryptAESGCM("gizli veri", "anahtar123")
-dec, _ := crypto.DecryptAESGCM(enc, "anahtar123")
+ct, err := crypto.EncryptAESGCM("gizli veri", "uzun-bir-anahtar")
+pt, err := crypto.DecryptAESGCM(ct, "uzun-bir-anahtar")
 ```
 
-### HMAC-SHA256 İmzalama/Doğrulama
+- Anahtar, her şifrelemede yeni rastgele tuz ile **Argon2id** (t=2, m=19 MiB,
+  p=1) kullanılarak 32 bayta türetilir; AES-256-GCM ile şifrelenir.
+- Çıktı biçimi sürümlüdür: `v2.` + base64url(tuz | nonce | şifreli metin + etiket).
+- `DecryptAESGCM` eski (öneksiz, `SHA-256(anahtar)`) biçimdeki verileri de çözer;
+  mevcut veriler kaybolmaz. Yeniden şifrelemek için çözüp `EncryptAESGCM` ile tekrar yazın.
+- KDF bilinçli olarak yavaştır (çağrı başına onlarca ms); sıcak yolda her istekte çağırmayın.
+
+## HMAC-SHA256
+
 ```go
-sig := crypto.HMACSign("mesaj", "hmac-key")
-valid := crypto.HMACVerify("mesaj", "hmac-key", sig) // true
+sig := crypto.HMACSign("mesaj", "anahtar")        // hex
+ok := crypto.HMACVerify("mesaj", "anahtar", sig)  // sabit zamanlı
 ```
 
-### Token Üretimi (AES/HMAC ile)
+## İmzalı token (önerilen)
+
+Parola taşımayan, kimlik/claim tabanlı, süreli token. Çıktı standart bir JWT'dir
+(HS256), başka kütüphanelerle de doğrulanabilir.
+
 ```go
-// AES ile
-bearer, _ := crypto.GenerateBearerTokenFromCredentials("kullanici", "sifre", crypto.WithAESKey("anahtar"), crypto.WithExpiry(time.Hour))
-// HMAC ile
-bearer, _ := crypto.GenerateBearerTokenFromCredentials("kullanici", "sifre", crypto.WithHMACKey("hmac-key"), crypto.WithExpiry(time.Hour))
+key := []byte(os.Getenv("TOKEN_KEY")) // en az 32 bayt
+
+tok, err := crypto.GenerateSignedToken(key, "user-42",
+    map[string]any{"role": "admin"}, 15*time.Minute)
+
+claims, err := crypto.ParseSignedToken(r.Header.Get("Authorization"), key) // "Bearer " öneki atılır
+switch {
+case errors.Is(err, crypto.ErrTokenExpired):
+case errors.Is(err, crypto.ErrInvalidToken):
+case err == nil:
+    fmt.Println(claims.Subject, claims.Custom["role"], claims.ExpiresAt)
+}
 ```
 
-### Token Çözümleme
+Seçenekler: `crypto.WithLeeway(30*time.Second)`, `crypto.WithClock(fn)`,
+`crypto.AllowNoExpiry()` (süresiz token üretimi/kabulü — önerilmez).
+
+Hatalar: `ErrInvalidToken`, `ErrTokenExpired`, `ErrNoExpiry`,
+`ErrTokenNotYetValid`, `ErrWeakKey`.
+
+## Kimlik bilgisi taşıyan eski token'lar (Deprecated)
+
+`GenerateBearerTokenFromCredentials`, `ParseBearerToken` ve
+`GenerateBasicBearer` geriye dönük uyumluluk için korunur ama **Deprecated**
+olarak işaretlidir: token içinde parola taşırlar.
+
 ```go
-user, pass, valid, err := crypto.ParseBearerToken(bearer, crypto.WithAESKey("anahtar"))
+tok, err := crypto.GenerateBearerTokenFromCredentials("alice", "s3cr3t",
+    crypto.WithHMACKey("hmac-anahtari"), crypto.WithPrefix("Bearer"),
+    crypto.WithExpiry(time.Hour))
+user, pass, ok, err := crypto.ParseBearerToken(tok,
+    crypto.WithHMACKey("hmac-anahtari"), crypto.WithPrefix("Bearer"))
+
+basic := crypto.GenerateBasicBearer("bob", "pwd") // "Bearer base64(bob:pwd)"
 ```
 
-### Basit Bearer Token
-```go
-b := crypto.GenerateBasicBearer("kullanici", "sifre")
-```
+Modlar:
 
-## Notlar
-- AES anahtarı en az 16 karakter olmalıdır.
-- HMAC anahtarı gizli tutulmalıdır.
-- Token süresi (expiry) ayarlanabilir.
+| Seçenek | Biçim | Koruma |
+|---|---|---|
+| `WithAESKey` | AES-GCM (v2) şifreli JSON | Gizlilik + bütünlük |
+| `WithHMACKey` | `base64(json).hmacHex` | Yalnızca bütünlük — parola base64 içinde **okunabilir** |
+| (anahtarsız) | `base64(user:pass)` | **Hiçbiri** — HTTP Basic ile eşdeğer |
 
-Daha fazla detay için kodu inceleyebilirsiniz.
+`WithExpiry` verilmezse token süresizdir; anahtarsız modda süre hiç uygulanmaz.
 
+## Güvenlik notları
+
+- **Token modları (fail-closed)**: `ParseBearerToken`, `WithAESKey` verildiğinde
+  yalnızca AES biçimini, `WithHMACKey` verildiğinde yalnızca imzalı biçimi kabul
+  eder; biçime uymayan token `ErrInvalidToken` ile reddedilir. İmzasız
+  `base64(user:pass)` yalnızca hiçbir anahtar verilmediğinde kabul edilir.
+  (Önceki sürümde HMAC anahtarı tanımlıyken imzasız token kabul ediliyordu.)
+- Yeni kodda `GenerateSignedToken` / `ParseSignedToken` kullanın; token'a parola koymayın.
+- İmzalı token payload'u şifreli değildir; gizli bilgi koymayın.
+- İmza doğrulaması sabit zamanlıdır (`hmac.Equal`); `alg` başlığı yalnızca `HS256` kabul edilir.

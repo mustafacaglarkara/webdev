@@ -1,25 +1,38 @@
+// Package policy; casbin tabanlı yetkilendirme sarmalayıcısıdır. Yalnızca net/http ve
+// casbin'e bağlıdır: fiber middleware'i pkg/policy/fiberpolicy, GORM adaptörü
+// pkg/policy/gormpolicy alt paketlerindedir.
 package policy
 
 import (
+	"errors"
+	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/casbin/casbin/v2"
+	"github.com/casbin/casbin/v2/persist"
 	"github.com/casbin/casbin/v2/util"
 )
 
-// Manager, casbin enforcer sarmalayıcısıdır.
+// ErrNotInitialized varsayılan enforcer başlatılmadan kullanıldığında döner.
+var ErrNotInitialized = errors.New("policy: enforcer not initialised")
+
+// Manager, eşzamanlı kullanım için güvenli casbin SyncedEnforcer sarmalayıcısıdır.
 type Manager struct {
-	e *casbin.Enforcer
+	mu sync.RWMutex // adaptör değişimi / yeniden yükleme ile kural yazımını sıralar
+	e  *casbin.SyncedEnforcer
+
+	// loadModel nil değilse Reload modeli dosya yolu yerine bu yükleyiciden alır
+	// (gömülü dosya / metin; A5-3).
+	loadModel ModelLoader
+
+	lastMu     sync.RWMutex
+	lastReload time.Time
 }
 
-// New, model ve policy dosyaları ile yeni bir enforcer başlatır.
-func New(modelConfPath, policyPath string) (*Manager, error) {
-	e, err := casbin.NewEnforcer(modelConfPath, policyPath)
-	if err != nil {
-		return nil, err
-	}
-	// register keyMatch2 for wildcard path matching (govaluate wrapper)
+func newManager(e *casbin.SyncedEnforcer) *Manager {
+	// keyMatch2 casbin'de yerleşik olsa da eski modellerle uyum için açıkça kaydedilir.
 	e.AddFunction("keyMatch2", func(args ...interface{}) (interface{}, error) {
 		if len(args) != 2 {
 			return false, nil
@@ -31,22 +44,164 @@ func New(modelConfPath, policyPath string) (*Manager, error) {
 		}
 		return util.KeyMatch2(a, b), nil
 	})
-	return &Manager{e: e}, nil
+	m := &Manager{e: e}
+	m.touch()
+	return m
+}
+
+// New, model ve policy (CSV) dosyaları ile yeni bir enforcer başlatır.
+func New(modelConfPath, policyPath string) (*Manager, error) {
+	var (
+		e   *casbin.SyncedEnforcer
+		err error
+	)
+	if policyPath == "" {
+		e, err = casbin.NewSyncedEnforcer(modelConfPath)
+	} else {
+		e, err = casbin.NewSyncedEnforcer(modelConfPath, policyPath)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return newManager(e), nil
+}
+
+// NewWithAdapter, model dosyası ve bir persist.Adapter (ör. gormpolicy.NewAdapter) ile
+// enforcer başlatır ve politikaları adaptörden yükler.
+func NewWithAdapter(modelConfPath string, a persist.Adapter) (*Manager, error) {
+	if a == nil {
+		return nil, errors.New("policy: nil adapter")
+	}
+	e, err := casbin.NewSyncedEnforcer(modelConfPath, a)
+	if err != nil {
+		return nil, err
+	}
+	return newManager(e), nil
+}
+
+func (m *Manager) touch() {
+	m.lastMu.Lock()
+	m.lastReload = time.Now()
+	m.lastMu.Unlock()
+}
+
+// LastReload son başarılı yükleme/değişiklik zamanı.
+func (m *Manager) LastReload() time.Time {
+	m.lastMu.RLock()
+	defer m.lastMu.RUnlock()
+	return m.lastReload
 }
 
 // Enforce, subject, object, action üçlüsü için yetki kontrolü yapar.
 func (m *Manager) Enforce(sub, obj, act any) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.e.Enforce(sub, obj, act)
 }
 
+// E alttaki SyncedEnforcer'a erişim (gelişmiş kullanım için).
+func (m *Manager) E() *casbin.SyncedEnforcer { return m.e }
+
+// SetAdapter enforcer adaptörünü değiştirir. Politikaları yüklemek için ardından Reload çağırın.
+func (m *Manager) SetAdapter(a persist.Adapter) error {
+	if a == nil {
+		return errors.New("policy: nil adapter")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.e.SetAdapter(a)
+	return nil
+}
+
+// Reload model ve politikaları yeniden yükler. Model dosya yolundan (New/NewWithAdapter)
+// ya da ModelLoader'dan (NewFS/NewFromText/NewWithModel) alınır. Yükleme sırasında
+// Enforce çağrıları bekler; hata olursa model/politika tutarsız kalabilir, bu yüzden
+// çağıran hata durumunda istekleri reddetmelidir (fail-closed).
+func (m *Manager) Reload() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.loadModel != nil {
+		mdl, err := m.loadModel()
+		if err != nil {
+			return err
+		}
+		m.e.SetModel(mdl)
+	} else if err := m.e.LoadModel(); err != nil {
+		return err
+	}
+	if err := m.e.LoadPolicy(); err != nil {
+		return err
+	}
+	m.touch()
+	return nil
+}
+
+// Policies mevcut politika kurallarını döner.
+func (m *Manager) Policies() ([][]string, error) {
+	return m.e.GetPolicy()
+}
+
+// AddPolicy yeni kural ekler; eklendiyse true döner.
+func (m *Manager) AddPolicy(sub, obj, act string) (bool, error) {
+	if sub == "" || obj == "" || act == "" {
+		return false, errors.New("policy: empty rule field")
+	}
+	m.mu.RLock()
+	added, err := m.e.AddPolicy(sub, obj, act)
+	m.mu.RUnlock()
+	if err == nil && added {
+		m.touch()
+	}
+	return added, err
+}
+
+// RemovePolicy kuralı siler; bulunduysa true döner.
+func (m *Manager) RemovePolicy(sub, obj, act string) (bool, error) {
+	if sub == "" || obj == "" || act == "" {
+		return false, errors.New("policy: empty rule field")
+	}
+	m.mu.RLock()
+	removed, err := m.e.RemovePolicy(sub, obj, act)
+	m.mu.RUnlock()
+	if err == nil && removed {
+		m.touch()
+	}
+	return removed, err
+}
+
 // Middleware, istekten subject/object/action çıkarıp yetki kontrolü yapan HTTP middleware döner.
-func (m *Manager) Middleware(subject func(*http.Request) any, object func(*http.Request) any, action func(*http.Request) any) func(http.Handler) http.Handler {
+// nil fonksiyonlar için varsayılanlar: subject → "guest", object → r.URL.Path, action → r.Method.
+// Yetki yoksa 403, Enforce hatasında log + 500 döner (POL-4).
+func (m *Manager) Middleware(subject, object, action func(*http.Request) any) func(http.Handler) http.Handler {
+	return enforceMiddleware(func() *Manager { return m }, subject, object, action)
+}
+
+func enforceMiddleware(get func() *Manager, subject, object, action func(*http.Request) any) func(http.Handler) http.Handler {
+	if subject == nil {
+		subject = func(*http.Request) any { return "guest" }
+	}
+	if object == nil {
+		object = func(r *http.Request) any { return r.URL.Path }
+	}
+	if action == nil {
+		action = func(r *http.Request) any { return r.Method }
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			m := get()
+			if m == nil {
+				slog.Warn("policy: enforcer not initialised; denying request", "path", r.URL.Path)
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
 			allowed, err := m.Enforce(subject(r), object(r), action(r))
-			if err != nil || !allowed {
-				w.WriteHeader(http.StatusForbidden)
-				_, _ = w.Write([]byte("forbidden"))
+			if err != nil {
+				slog.Error("policy: enforce failed", "err", err, "path", r.URL.Path, "method", r.Method)
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+				return
+			}
+			if !allowed {
+				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}
 			next.ServeHTTP(w, r)
@@ -54,67 +209,116 @@ func (m *Manager) Middleware(subject func(*http.Request) any, object func(*http.
 	}
 }
 
-// Accessor enforcer (kullanıcı kodu için)
-func (m *Manager) E() *casbin.Enforcer {
-	return m.e
-}
-
 // --- Varsayılan enforcer ---
+
 var (
-	Default    *Manager
-	lastReload time.Time
+	defaultMu      sync.RWMutex
+	defaultManager *Manager
+	pendingAdapter persist.Adapter
 )
 
-// Init, varsayılan enforcer'ı başlatır.
-func Init(modelConfPath, policyPath string) (err error) {
-	Default, err = New(modelConfPath, policyPath)
-	if err == nil {
-		lastReload = time.Now()
-	}
-	return
+// DefaultManager varsayılan Manager'ı döner (başlatılmadıysa nil).
+func DefaultManager() *Manager {
+	defaultMu.RLock()
+	defer defaultMu.RUnlock()
+	return defaultManager
 }
 
-// Enforce, varsayılan enforcer üzerinden kontrol yapar.
-func Enforce(sub, obj, act any) (bool, error) {
-	if Default == nil {
-		return false, nil
-	}
-	return Default.Enforce(sub, obj, act)
+// SetDefault varsayılan Manager'ı değiştirir (nil ile sıfırlanabilir).
+func SetDefault(m *Manager) {
+	defaultMu.Lock()
+	defaultManager = m
+	defaultMu.Unlock()
 }
 
-// DefaultMiddleware, varsayılan enforcer ile middleware döner.
-func DefaultMiddleware(subject func(*http.Request) any, object func(*http.Request) any, action func(*http.Request) any) func(http.Handler) http.Handler {
-	if Default == nil {
-		return func(h http.Handler) http.Handler { return h }
+// Init varsayılan enforcer'ı başlatır. SetAdapter ile önceden bekleyen bir adaptör
+// verildiyse politikalar policyPath yerine o adaptörden yüklenir (POL-3).
+func Init(modelConfPath, policyPath string) error {
+	defaultMu.Lock()
+	defer defaultMu.Unlock()
+	var (
+		m   *Manager
+		err error
+	)
+	if pendingAdapter != nil {
+		m, err = NewWithAdapter(modelConfPath, pendingAdapter)
+	} else {
+		m, err = New(modelConfPath, policyPath)
 	}
-	return Default.Middleware(subject, object, action)
-}
-
-// Reload reloads all policies for the default enforcer.
-func Reload() error {
-	if Default == nil {
-		return nil
-	}
-	// Model + policy yeniden yükle (model değişiklikleri için)
-	if err := Default.e.LoadModel(); err != nil {
+	if err != nil {
 		return err
 	}
-	if err := Default.e.LoadPolicy(); err != nil {
-		return err
-	}
-	lastReload = time.Now()
+	pendingAdapter = nil
+	defaultManager = m
 	return nil
 }
 
-// LastReload son başarılı Reload zamanını döner (zero time olabilir).
-func LastReload() time.Time { return lastReload }
+// SetAdapter varsayılan enforcer'ın adaptörünü değiştirir. Enforcer henüz yoksa adaptör
+// bekletilir ve Init sırasında uygulanır. Enforcer varsa politikaları yüklemek için Reload çağırın.
+func SetAdapter(a persist.Adapter) error {
+	if a == nil {
+		return errors.New("policy: nil adapter")
+	}
+	defaultMu.Lock()
+	m := defaultManager
+	if m == nil {
+		pendingAdapter = a
+	}
+	defaultMu.Unlock()
+	if m != nil {
+		return m.SetAdapter(a)
+	}
+	return nil
+}
 
-// GetPolicyRules mevcut policy kurallarını döner.
+// Enforce varsayılan enforcer üzerinden kontrol yapar. Başlatılmadıysa
+// (false, ErrNotInitialized) döner.
+func Enforce(sub, obj, act any) (bool, error) {
+	m := DefaultManager()
+	if m == nil {
+		return false, ErrNotInitialized
+	}
+	return m.Enforce(sub, obj, act)
+}
+
+// Check string argümanlı Enforce'tur; imzası web.CanChecker ile uyumludur:
+//
+//	web.SetCanChecker(policy.Check)
+func Check(sub, obj, act string) (bool, error) {
+	return Enforce(sub, obj, act)
+}
+
+// DefaultMiddleware varsayılan enforcer ile middleware döner. Enforcer istek anında
+// çözümlenir: başlatılmamışsa istek 403 ile reddedilir (fail-closed, POL-1).
+func DefaultMiddleware(subject, object, action func(*http.Request) any) func(http.Handler) http.Handler {
+	return enforceMiddleware(DefaultManager, subject, object, action)
+}
+
+// Reload varsayılan enforcer'ın model ve politikalarını yeniden yükler.
+func Reload() error {
+	m := DefaultManager()
+	if m == nil {
+		return ErrNotInitialized
+	}
+	return m.Reload()
+}
+
+// LastReload son başarılı Reload zamanını döner (zero time olabilir).
+func LastReload() time.Time {
+	m := DefaultManager()
+	if m == nil {
+		return time.Time{}
+	}
+	return m.LastReload()
+}
+
+// GetPolicyRules mevcut policy kurallarını döner (hata/başlatılmamışsa nil).
 func GetPolicyRules() [][]string {
-	if Default == nil {
+	m := DefaultManager()
+	if m == nil {
 		return nil
 	}
-	rules, err := Default.e.GetPolicy()
+	rules, err := m.Policies()
 	if err != nil {
 		return nil
 	}
@@ -123,41 +327,26 @@ func GetPolicyRules() [][]string {
 
 // PolicyStats temel istatistikleri döner.
 func PolicyStats() map[string]any {
-	rules := GetPolicyRules()
 	return map[string]any{
-		"policy_count": len(rules),
-		"last_reload":  lastReload,
+		"policy_count": len(GetPolicyRules()),
+		"last_reload":  LastReload(),
 	}
 }
 
-// AddPolicyRule enforcera yeni bir kural ekler; yeni eklenirse true döner.
+// AddPolicyRule varsayılan enforcer'a yeni bir kural ekler; yeni eklenirse true döner.
 func AddPolicyRule(sub, obj, act string) (bool, error) {
-	if Default == nil || sub == "" || obj == "" || act == "" {
-		return false, nil
+	m := DefaultManager()
+	if m == nil {
+		return false, ErrNotInitialized
 	}
-	added, err := Default.e.AddPolicy(sub, obj, act)
-	if err != nil {
-		return false, err
-	}
-	if added {
-		lastReload = time.Now()
-	}
-	return added, nil
+	return m.AddPolicy(sub, obj, act)
 }
 
 // RemovePolicyRule verilen kuralı siler; bulunduysa true döner.
 func RemovePolicyRule(sub, obj, act string) (bool, error) {
-	if Default == nil || sub == "" || obj == "" || act == "" {
-		return false, nil
+	m := DefaultManager()
+	if m == nil {
+		return false, ErrNotInitialized
 	}
-	removed, err := Default.e.RemovePolicy(sub, obj, act)
-	if err != nil {
-		return false, err
-	}
-	if removed {
-		lastReload = time.Now()
-	}
-	return removed, nil
+	return m.RemovePolicy(sub, obj, act)
 }
-
-// (Fiber middleware helpers are implemented in fiber.go in this package.)

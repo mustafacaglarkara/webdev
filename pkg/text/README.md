@@ -1,133 +1,153 @@
-# helpers/text
-
-Bu klasör; metin ve dil işlemleri ile ilgili yardımcı fonksiyonları toplamak için oluşturuldu.
-
-Taşınacak dosyalar (plan):
-- metin.go (ör: ToSlug, TrimSpace, NormalizeWhitespace ...)
-- stringx.go (ör: Left, Right, ContainsAny, ReverseString ...)
-- slice.go (string slice manipülasyonu ile alakalı ortak kısmi fonksiyonlar buraya ayrılabilir veya `collection` altına taşınabilir)
-
-Geçiş Stratejisi:
-1. Orijinal `pkg/helpers/metin.go` ve `stringx.go` içeriği `package text` olarak taşınacak.
-2. `pkg/helpers` altında geriye dönük uyumluluk için ince wrapper fonksiyonlar bırakılacak; dış kullanım kırılmayacak.
-3. Testler: Basit smoke test + önceki fonksiyon imzalarını koruma testi.
-
-Not: Henüz kod taşınmadı, yalnızca klasör yapısı hazırlandı.
-
-# text paketi
-
-Metin ve dil işlemleri için yardımcı fonksiyonlar içerir. Türkçe karakter desteği, slug, ters çevirme, büyük/küçük harf, boşluk normalizasyonu, truncate, coalesce gibi işlemler için kullanılır.
-
-## Fonksiyonlar ve Detaylı Kullanım Örnekleri
-
-### ToSlug
-Türkçe karakterleri sadeleştirip, küçük harfe çevirir ve a-z0-9 ile '-' karakterlerinden oluşan bir slug üretir.
+# text
 
 ```go
-package main
-import (
-    "fmt"
-    "your/module/path/pkg/text"
-)
-func main() {
-    fmt.Println(text.ToSlug("Çalışma Alanı - 2025!")) // calisma-alani-2025
-    fmt.Println(text.ToSlug("Güzel Günler"))         // guzel-gunler
-}
+import "github.com/mustafacaglarkara/webdev/pkg/text"
 ```
 
+Metin işlemleri için kanonik paket: slug üretimi, güvenli dosya adı, Türkçe
+duyarlı büyük/küçük harf dönüşümü, mojibake onarımı, boşluk normalizasyonu ve
+bluemonday tabanlı HTML temizleme.
+
+`pkg/strutil` bu paketin ince bir sarmalayıcısıdır; yeni kodda doğrudan
+`pkg/text` kullanın.
+
+Aşağıdaki örneklerin çıktıları `example_test.go` içinde `go test` ile
+doğrulanır.
+
+## Slug
+
+### ToSlug
+
+Türkçe harfleri açıkça çevirir (`İ`/`I` dahil), diğer aksanlı harfleri Unicode
+NFD normalizasyonu ile sadeleştirir, `a-z0-9` dışındaki her şeyi tek `-` yapar.
+
+```go
+fmt.Println(text.ToSlug("Çalışma Alanı - 2025!")) // calisma-alani-2025
+fmt.Println(text.ToSlug("İstanbul IŞIK"))         // istanbul-isik
+fmt.Println(text.ToSlug("Kâğıt café crème"))      // kagit-cafe-creme
+fmt.Printf("%q\n", text.ToSlug("日本語"))          // ""
+```
+
+Latin alfabesine çevrilemeyen metinler (CJK, emoji, yalnızca noktalama) için
+**boş string** döner; URL üretirken bu durumu kontrol edin.
+
 ### ToSlugForFile
-Dosya adları için güvenli slug üretir, son uzantıyı korur.
+
+Kullanıcıdan gelen dosya adlarından güvenli ad üretir. Hiçbir girdide panik
+atmaz (fuzz testi: `FuzzToSlugForFile`). Sonuç her zaman tek bir yol
+bileşenidir: yalnızca `[a-z0-9-]` ve en fazla bir `.` içerir, boş değildir,
+`.`/`..` olamaz, dizin ayracı, boşluk veya kontrol karakteri içermez.
 
 ```go
 fmt.Println(text.ToSlugForFile("Çılgın Fotoğraf(1).JPG")) // cilgin-fotograf-1.jpg
 fmt.Println(text.ToSlugForFile("rapor.v1.2.PDF"))         // rapor-v1-2.pdf
+fmt.Println(text.ToSlugForFile("../../etc/passwd"))       // etc-passwd
+fmt.Println(text.ToSlugForFile(".jpg"))                   // file.jpg
+fmt.Println(text.ToSlugForFile(""))                       // file
+fmt.Println(text.ToSlugForFile("belge."))                 // belge
 ```
 
-### ReverseString
-Unicode (rune-safe) olarak string'i ters çevirir.
+Kurallar:
+
+- Yalnızca son uzantı korunur; uzantı küçük harfe çevrilir, yalnızca ASCII
+  harf/rakam bırakılır ve en fazla 16 karakterdir. Temizlendikten sonra boş
+  kalan uzantı (sondaki nokta, `x.$$$`) atılır.
+- Ad kısmı `ToSlug` ile çevrilir, en fazla 200 bayttır; boşa düşerse `file`
+  kullanılır.
+- Uzantı yalnızca ada göre temizlenir, içerik doğrulanmaz. Yüklenen dosyanın
+  türünü içerikten (ör. MIME sniffing) ayrıca kontrol edin.
+
+## Büyük/küçük harf
+
+`ToUpper`/`ToLower` yerel ayardan bağımsızdır (`strings.ToUpper/ToLower`).
+Türkçe metinlerde `ToUpperTR`, `ToLowerTR`, `TitleTR` kullanın.
 
 ```go
-fmt.Println(text.ReverseString("merhaba"))  // abahrem
-fmt.Println(text.ReverseString("İstanbul")) // lubnatsİ
+fmt.Println(text.ToUpper("istanbul ılık"))      // ISTANBUL ILIK
+fmt.Println(text.ToUpperTR("istanbul ılık"))    // İSTANBUL ILIK
+fmt.Println(text.ToLowerTR("IŞIK İSTANBUL"))    // ışık istanbul
+fmt.Println(text.TitleTR("iSTANBUL ılık"))      // İstanbul Ilık
 ```
 
-### ToUpper / ToLower
+Not: `text.ToLower("IŞIK")` sonucu `"işik"`tir (`I` -> `i`); Türkçe için
+`ToLowerTR` kullanın (`"ışık"`).
+
+## FixTurkishMojibake
+
+UTF-8 olarak kaydedilmiş ancak Latin-1 (ISO-8859-1), Windows-1252,
+Windows-1254 veya ISO-8859-9 olarak çözülmüş metni onarır. `ş`/`Ş`, `ğ`/`Ğ`,
+`ı`/`İ` dahil tüm Türkçe harfleri ayırt eder, doğru metne dokunmaz ve
+deterministiktir.
 
 ```go
-fmt.Println(text.ToUpper("merhaba"))  // MERHABA
-fmt.Println(text.ToLower("İSTANBUL")) // istanbul
+fmt.Println(text.FixTurkishMojibake("GÃ¼nÃ¼n Ã¶zeti: Ã‡aÄŸdaÅŸlÄ±k")) // Günün özeti: Çağdaşlık
+fmt.Println(text.FixTurkishMojibake("ÅŸ Åž Ä± Ä°"))                    // ş Ş ı İ
+fmt.Println(text.FixTurkishMojibake("KÂR"))                            // KÂR
 ```
 
-### IsBlank
-Sadece whitespace ise true döner.
+Yöntem: metin önce tek baytlık kodlamayla bayta geri çevrilir; sonuç geçerli
+UTF-8 ve makul (Latin/Türkçe harf, noktalama) ise kabul edilir. Olmazsa sabit
+sıralı bir Türkçe harf tablosu uygulanır (doğru ve bozuk karakterlerin karışık
+olduğu metinler için). Sınırlama: bozulma sırasında bayt kaybolmuşsa (ör.
+Windows-1254'te tanımsız `0x9E` nedeniyle `Ş`/`Ğ` yerine `�` oluşmuşsa veya
+C1 kontrol karakterleri silinmişse, yalnız kalan `Ã`, `Å` gibi) onarım mümkün
+değildir; bu karakterler olduğu gibi bırakılır.
+
+## HTML temizleme
+
+`SanitizeHTML` bluemonday UGC politikasını, `SanitizeHTMLStrict` tüm etiketleri
+kaldıran politikayı kullanır. Politikalar paket yüklenirken bir kez kurulur ve
+eşzamanlı kullanım için güvenlidir.
 
 ```go
-fmt.Println(text.IsBlank("   \t\n")) // true
-fmt.Println(text.IsBlank("  x  "))    // false
-```
+unsafe := `<script>alert('x')</script><b>kalın</b> <a href="http://ex.com" onclick="x()">link</a>`
+fmt.Println(text.SanitizeHTML(unsafe))
+// <b>kalın</b> <a href="http://ex.com" rel="nofollow">link</a>
+fmt.Println(text.SanitizeHTMLStrict(unsafe))
+// kalın link
 
-### Coalesce
-Verilen stringler arasında boş olmayan ilkini döner.
-
-```go
-fmt.Println(text.Coalesce("", "", "ilk")) // ilk
-fmt.Println(text.Coalesce("", ""))         // ""
-```
-
-### Truncate
-Unicode (rune-safe) olarak string'i n karaktere keser.
-
-```go
-fmt.Println(text.Truncate("merhaba dünya", 7)) // merhaba
-fmt.Println(text.Truncate("abc", 10))         // abc
-fmt.Println(text.Truncate("", 5))             // ""
-```
-
-### NormalizeSpace
-Çoklu boşlukları tek boşluğa indirger, baştaki ve sondaki boşlukları kırpar.
-
-```go
-fmt.Println(text.NormalizeSpace("  merhaba   dünya   ")) // "merhaba dünya"
-fmt.Println(text.NormalizeSpace("a   b\tc\nd"))        // "a b c d"
-```
-
-### UnescapeHTML
-HTML entity'lerini gerçek karakterlere çözer.
-
-```go
-fmt.Println(text.UnescapeHTML("&Ccedil;alışma &amp; Deneme")) // Çalışma & Deneme
-```
-
-### FixTurkishMojibake
-Yanlış encoding sonucu oluşan yaygın Türkçe karakter bozulmalarını düzeltir.
-
-```go
-s := "GÃ¼nÃ¼n Ã¶zeti: ÃaÄdaÅlÄ±k"
-fmt.Println(text.FixTurkishMojibake(s)) // Günün özeti: Çağdaşlık
-```
-
-### SanitizeHTML / SanitizeHTMLWith
-Kullanıcı girdisini güvenli HTML'e çevirir (bluemonday UGCPolicy varsayılan).
-
-```go
-unsafe := "<script>alert('x')</script><b>kalın</b> <a href='http://ex.com' onclick='x()'>link</a>"
-safe := text.SanitizeHTML(unsafe) // script/onclick kaldırılır, uygun etiketler korunur
-
-// Özel policy
+// Özel politika: HTMLPolicyUGC / HTMLPolicyStrict her çağrıda YENİ bir kopya
+// döner; özelleştirmeler varsayılanı etkilemez. Politikayı bir kez kurup
+// saklayın (ör. paket değişkeni), her istekte yeniden oluşturmayın.
 p := text.HTMLPolicyUGC()
-p.AllowAttrs("class").OnElements("span", "div")
-safe2 := text.SanitizeHTMLWith(p, unsafe)
+p.AllowAttrs("class").OnElements("span")
+fmt.Println(text.SanitizeHTMLWith(p, `<span class="not">x</span>`))
+// <span class="not">x</span>
 ```
 
-## Edge-Case ve Hata Yönetimi
-- ToSlug: Sadece özel karakterlerden oluşan string için "" döner.
-- ToSlugForFile: Birden fazla noktayı tek uzantıya indirger, uzantı yoksa sadece güvenli ad döner.
-- Truncate: n<=0 ise "" döner, n>len(s) ise orijinal string döner.
-- Coalesce: Tüm argümanlar boşsa "" döner.
-- IsBlank: Sadece boşluk karakterleri varsa true, en az bir harf/rakam varsa false.
-- SanitizeHTML: script/style event handler'ları (onclick vb.) kaldırılır.
+`SanitizeHTMLWith(nil, s)` varsayılan UGC politikasını kullanır.
 
-## Notlar
-- Tüm fonksiyonlar Unicode/rune-safe çalışır.
-- Türkçe karakter desteği ToSlug ve ToSlugForFile fonksiyonlarında mevcuttur.
-- HTML sanitize işlemi için `github.com/microcosm-cc/bluemonday` kullanılır.
+Güvenlik notu: temizlenmiş HTML'i şablonda kaçışsız basarken yalnızca bu
+fonksiyonların çıktısını kullanın; temizlik sonrası metne tekrar ekleme
+yapmayın.
+
+## Diğer yardımcılar
+
+```go
+fmt.Println(text.Truncate("merhaba dünya", 9))                  // merhaba d
+fmt.Println(text.NormalizeSpace("  çok   fazla\t boşluk \n"))   // çok fazla boşluk
+fmt.Println(text.ReverseString("İstanbul"))                     // lubnatsİ
+fmt.Println(text.Coalesce("", "", "ilk"))                       // ilk
+fmt.Println(text.IsBlank(" \t\n"))                              // true
+fmt.Println(text.UnescapeHTML("&Ccedil;alışma &amp; Deneme"))   // Çalışma & Deneme
+fmt.Println(text.SplitAndTrim(" a , b ,, c "))                  // [a b c]
+```
+
+- `Truncate(s, n)`: rune sayısına göre keser; `n <= 0` ise `""`.
+- `NormalizeSpace`: tüm Unicode boşluklarını (NBSP dahil) tek boşluğa indirir.
+- `Coalesce`: boş olmayan ilk metni döner (yalnızca boşluktan oluşan metin boş
+  sayılmaz; gerekirse `IsBlank` ile birleştirin).
+- `SplitAndTrim`: virgülle böler, kırpar, boşları atar; boş girdide `nil`.
+
+## API özeti
+
+| Fonksiyon | Açıklama |
+|---|---|
+| `ToSlug(s) string` | URL slug'ı; çevrilemeyen girdi için `""` |
+| `ToSlugForFile(name) string` | Güvenli dosya adı; asla boş/panik değil |
+| `ToUpper`, `ToLower` | Yerel ayardan bağımsız |
+| `ToUpperTR`, `ToLowerTR`, `TitleTR` | Türkçe kurallar |
+| `FixTurkishMojibake(s) string` | Latin-1/1252/1254/8859-9 onarımı |
+| `SanitizeHTML`, `SanitizeHTMLStrict`, `SanitizeHTMLWith` | bluemonday |
+| `HTMLPolicyUGC`, `HTMLPolicyStrict` | Özelleştirilebilir politika kopyası |
+| `ReverseString`, `Truncate`, `NormalizeSpace`, `IsBlank`, `Coalesce`, `UnescapeHTML`, `SplitAndTrim` | Genel |
